@@ -86,6 +86,8 @@ pub struct App {
     gradients: HashMap<String, TextureHandle>,
     logo: TextureHandle,
     updater: Updater,
+    /// Whether the local keyboard is currently being sent to the remote.
+    capturing_keys: bool,
     #[cfg(debug_assertions)]
     preview: Option<(String, Instant)>,
 }
@@ -96,6 +98,7 @@ impl App {
         let net = Net::start(crate::config::Config::load(), cc.egui_ctx.clone())?;
         let updater = Updater::start(net.runtime(), cc.egui_ctx.clone());
         Ok(App {
+            capturing_keys: false,
             updater,
             net,
             address: String::new(),
@@ -134,6 +137,7 @@ impl App {
         *updater.state.lock().unwrap() =
             UpdateState::Available { version: "1.1.0".into(), notes: "ตัวอย่าง".into() };
         let mut app = App {
+            capturing_keys: false,
             updater,
             net,
             address: String::new(),
@@ -868,6 +872,10 @@ impl App {
                     ui.add_space(10.0);
                     let (c, t) = if direct { (GREEN, "เชื่อมต่อตรง") } else { (AMBER, "ผ่าน Relay") };
                     pill(ui, c, t);
+                    if crate::localinput::key_capture_active() {
+                        ui.label(RichText::new("คีย์ลัดทั้งหมดส่งไปเครื่องปลายทาง").color(MUTED).size(12.5))
+                            .on_hover_text("รวมถึงปุ่ม Win และ Alt+Tab คลิกนอกหน้าต่างเพื่อใช้คีย์บอร์ดกับเครื่องตัวเอง");
+                    }
                     if remote_busy {
                         pill(ui, AMBER, "ปลายทางกำลังใช้เมาส์/คีย์บอร์ดเอง");
                     }
@@ -1020,6 +1028,28 @@ impl eframe::App for App {
             self.home_ui(ui);
         }
         self.transfers_ui(ui.ctx());
+        self.update_key_capture(ui.ctx());
+    }
+}
+
+impl App {
+    /// Grabs the whole keyboard (Win, Alt+Tab, ...) while a connected session window is focused
+    /// and no dialog is open; releases it the moment that stops being true.
+    fn update_key_capture(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        let tx = self.session.as_ref().and_then(|s| {
+            let v = s.viewer.lock().unwrap();
+            (v.status == ViewStatus::Connected).then(|| v.input.clone()).flatten()
+        });
+        let want = focused && tx.is_some() && self.pending.is_none() && self.settings.is_none();
+        if want != self.capturing_keys {
+            self.capturing_keys = want;
+            crate::localinput::set_key_capture(tx.filter(|_| want).map(|tx| {
+                Box::new(move |input: Input| {
+                    let _ = tx.send(input);
+                }) as Box<dyn Fn(Input) + Send>
+            }));
+        }
     }
 }
 

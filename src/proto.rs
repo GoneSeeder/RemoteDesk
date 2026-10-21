@@ -68,6 +68,9 @@ pub enum Input {
     Text(String),
     /// The controller's clipboard changed.
     Clipboard(String),
+    /// A physical key exactly as the controller's keyboard reported it (captured with a
+    /// low-level hook, so Win/Alt+Tab/etc. reach the remote instead of the local machine).
+    RawKey { vk: u16, scan: u16, extended: bool, down: bool },
 }
 
 /// Messages from the controlled machine on its second uni stream.

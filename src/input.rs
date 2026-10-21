@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use eframe::egui;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
@@ -71,6 +71,21 @@ fn mouse_to(x: i32, y: i32) -> bool {
     send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0)
 }
 
+fn send_key(vk: u16, scan: u16, extended: bool, down: bool) -> bool {
+    let mut flags = 0;
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
+}
+
 fn button_flags(button: u8, down: bool) -> MOUSE_EVENT_FLAGS {
     match (button, down) {
         (1, true) => MOUSEEVENTF_RIGHTDOWN,
@@ -94,6 +109,7 @@ fn run(rx: Receiver<Cmd>) {
     let mut mods = [false; 3]; // ctrl, shift, alt as currently held by us
     let mut held_keys: Vec<u16> = Vec::new();
     let mut held_buttons: Vec<u8> = Vec::new();
+    let mut held_raw: Vec<(u16, u16, bool)> = Vec::new();
     let (mut received, mut paused, mut failed) = (0u64, 0u64, 0u64);
 
     let set_mod = |enigo: &mut Option<Enigo>, held: &mut bool, vk: u16, want: bool| {
@@ -112,7 +128,12 @@ fn run(rx: Receiver<Cmd>) {
         if let Cmd::Input(_, ev) = &cmd {
             let press = matches!(
                 ev,
-                Input::MouseMove { .. } | Input::Scroll { .. } | Input::Button { down: true, .. } | Input::Key { down: true, .. } | Input::Text(_)
+                Input::MouseMove { .. }
+                    | Input::Scroll { .. }
+                    | Input::Button { down: true, .. }
+                    | Input::Key { down: true, .. }
+                    | Input::RawKey { down: true, .. }
+                    | Input::Text(_)
             );
             received += 1;
             if press && crate::localinput::local_active() {
@@ -177,11 +198,24 @@ fn run(rx: Receiver<Cmd>) {
                 }
             }
             Cmd::Input(_, Input::Clipboard(_)) => {}
+            Cmd::Input(_, Input::RawKey { vk, scan, extended, down }) => {
+                if !send_key(vk, scan, extended, down) {
+                    failed += 1;
+                    log(&format!("SendInput(key) failed, error {}", std::io::Error::last_os_error()));
+                }
+                held_raw.retain(|&(v, _, _)| v != vk);
+                if down {
+                    held_raw.push((vk, scan, extended));
+                }
+            }
             Cmd::Reset => {
                 for vk in held_keys.drain(..) {
                     if let Some(e) = &mut enigo {
                         let _ = e.key(Key::Other(vk as u32), Direction::Release);
                     }
+                }
+                for (vk, scan, extended) in held_raw.drain(..) {
+                    send_key(vk, scan, extended, false);
                 }
                 for b in held_buttons.drain(..) {
                     send_mouse(button_flags(b, false), 0, 0, 0);
