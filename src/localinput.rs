@@ -3,7 +3,9 @@
 //! Windows' "injected" flag and is ignored here.
 
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
 
 use crate::proto::Input;
 
@@ -18,31 +20,67 @@ pub const LOCAL_PRIORITY_MS: u64 = 1000;
 
 static LAST_LOCAL: AtomicU64 = AtomicU64::new(0);
 
-/// While a remote session window is focused, every physical key goes to this sink and is
+/// While a remote session window is focused, every physical key is forwarded to the remote and
 /// swallowed locally (like AnyDesk), so shortcuts such as Win+E act on the remote machine.
 static CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// One captured key: (vk, scan, extended, down). Sent from the low-level hook — which must stay
+/// fast or Windows silently drops it — to a forwarder thread that does the real work.
+type KeyEvent = (u16, u16, bool, bool);
+static KEY_TX: OnceLock<Sender<KeyEvent>> = OnceLock::new();
 static KEY_SINK: Mutex<Option<Box<dyn Fn(Input) + Send>>> = Mutex::new(None);
-/// Keys currently held down on the remote because of us: (vk, scan, extended).
+/// Keys currently held on the remote because of us: (vk, scan, extended). Touched only by the
+/// forwarder thread and `set_key_capture`, never by the hook, so a lock here is safe.
 static HELD: Mutex<Vec<(u16, u16, bool)>> = Mutex::new(Vec::new());
 
 /// Starts or stops sending the local keyboard to the remote. Stopping releases any key the
 /// remote still thinks is held (e.g. Alt when the window lost focus during Alt+Tab).
 pub fn set_key_capture(sink: Option<Box<dyn Fn(Input) + Send>>) {
+    ensure_forwarder();
     let on = sink.is_some();
-    let mut current = KEY_SINK.lock().unwrap();
-    if !on {
-        if let Some(old) = current.as_ref() {
+    // Flip the atomic first so the hook stops/starts swallowing immediately.
+    CAPTURE.store(on, Ordering::Relaxed);
+    if on {
+        *KEY_SINK.lock().unwrap() = sink;
+    } else {
+        // Release held keys with the current sink before dropping it.
+        let current = KEY_SINK.lock().unwrap().take();
+        if let Some(s) = &current {
             for (vk, scan, extended) in HELD.lock().unwrap().drain(..) {
-                old(Input::RawKey { vk, scan, extended, down: false });
+                s(Input::RawKey { vk, scan, extended, down: false });
             }
         }
     }
-    *current = sink;
-    CAPTURE.store(on, Ordering::Relaxed);
 }
 
 pub fn key_capture_active() -> bool {
     CAPTURE.load(Ordering::Relaxed)
+}
+
+/// The forwarder thread: reads keys from the hook, tracks which are held, and calls the current
+/// sink. Kept off the hook so the hook never blocks.
+fn ensure_forwarder() {
+    KEY_TX.get_or_init(|| {
+        let (tx, rx) = channel::<KeyEvent>();
+        std::thread::spawn(move || {
+            while let Ok((vk, scan, extended, down)) = rx.recv() {
+                if !CAPTURE.load(Ordering::Relaxed) {
+                    continue;
+                }
+                {
+                    let mut held = HELD.lock().unwrap();
+                    held.retain(|&(v, _, _)| v != vk);
+                    if down {
+                        held.push((vk, scan, extended));
+                    }
+                }
+                if let Some(s) = KEY_SINK.lock().unwrap().as_ref() {
+                    s(Input::RawKey { vk, scan, extended, down });
+                }
+            }
+        });
+        tx
+    });
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
@@ -60,18 +98,17 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize)
         let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if info.flags & LLKHF_INJECTED == 0 {
             if CAPTURE.load(Ordering::Relaxed) {
-                if let Some(sink) = KEY_SINK.lock().unwrap().as_ref() {
-                    let (vk, scan) = (info.vkCode as u16, info.scanCode as u16);
-                    let extended = info.flags & LLKHF_EXTENDED != 0;
-                    let down = info.flags & LLKHF_UP == 0;
-                    let mut held = HELD.lock().unwrap();
-                    held.retain(|&(v, _, _)| v != vk);
-                    if down {
-                        held.push((vk, scan, extended));
-                    }
-                    sink(Input::RawKey { vk, scan, extended, down });
-                    return 1; // swallow locally
+                // Keep this path minimal: just forward the key and swallow it. Doing real work
+                // (locks, channel to the network) here can exceed Windows' hook timeout, which
+                // silently drops the hook so the shortcut leaks to the local machine instead.
+                let vk = info.vkCode as u16;
+                let scan = info.scanCode as u16;
+                let extended = info.flags & LLKHF_EXTENDED != 0;
+                let down = info.flags & LLKHF_UP == 0;
+                if let Some(tx) = KEY_TX.get() {
+                    let _ = tx.send((vk, scan, extended, down));
                 }
+                return 1; // swallow locally
             }
             LAST_LOCAL.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
         }
