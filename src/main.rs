@@ -24,6 +24,52 @@ pub fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // Dev check: `remotedesk --codec-bench` encodes+decodes moving 1080p frames and reports speed.
+    #[cfg(debug_assertions)]
+    if std::env::args().nth(1).as_deref() == Some("--codec-bench") {
+        use openh264::decoder::Decoder;
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
+        use openh264::formats::{RgbaSliceU8, YUVBuffer};
+        let (w, h) = (1920usize, 1080usize);
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(6_000_000))
+            .max_frame_rate(FrameRate::from_hz(30.0))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate);
+        let mut enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config).unwrap();
+        let mut dec = Decoder::new().unwrap();
+        let mut rgba = vec![40u8; w * h * 4];
+        let (mut bytes, mut enc_ms, mut dec_ms, frames) = (0usize, 0f64, 0f64, 90);
+        let mut out = vec![0u8; w * h * 4];
+        for f in 0..frames {
+            // A window-sized block sliding across a static desktop, like dragging a window.
+            for y in 300..700 {
+                for x in 0..600 {
+                    let px = ((x + f * 12) % w + y * w) * 4;
+                    rgba[px..px + 4].copy_from_slice(&[(f * 3) as u8, 120, 200, 255]);
+                }
+            }
+            let t = std::time::Instant::now();
+            let yuv = YUVBuffer::from_rgba8_source(RgbaSliceU8::new(&rgba, (w, h)));
+            let data = enc.encode(&yuv).unwrap().to_vec();
+            enc_ms += t.elapsed().as_secs_f64() * 1000.0;
+            bytes += data.len();
+            let t = std::time::Instant::now();
+            if let Ok(Some(img)) = dec.decode(&data) {
+                img.write_rgba8(&mut out);
+            }
+            dec_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
+        println!(
+            "{frames} frames 1080p: encode {:.1} ms/frame, decode {:.1} ms/frame, avg {:.0} KB/frame, {:.0} KB/s at 30fps",
+            enc_ms / frames as f64,
+            dec_ms / frames as f64,
+            bytes as f64 / frames as f64 / 1024.0,
+            bytes as f64 / frames as f64 * 30.0 / 1024.0
+        );
+        std::process::exit(0);
+    }
+
     // Dev check: `remotedesk --clip-test` round-trips a file list through the clipboard.
     #[cfg(debug_assertions)]
     if std::env::args().nth(1).as_deref() == Some("--clip-test") {
@@ -173,6 +219,16 @@ fn selftest(log_path: &str) {
         )
         .ok();
         writeln!(log, "host sees incoming sessions: {}", host.shared.lock().unwrap().incoming.len()).ok();
+        // Save the decoded picture next to the log so its quality can be inspected.
+        if let Some(p) = vv.patches.last() {
+            let mut jpeg = Vec::new();
+            if jpeg_encoder::Encoder::new(&mut jpeg, 95)
+                .encode(&p.rgba, p.size[0] as u16, p.size[1] as u16, jpeg_encoder::ColorType::Rgba)
+                .is_ok()
+            {
+                std::fs::write(format!("{log_path}.frame.jpg"), jpeg).ok();
+            }
+        }
     }
 
     // File transfer both ways, compared byte for byte.

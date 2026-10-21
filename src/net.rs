@@ -15,8 +15,6 @@ use iroh::{Endpoint, EndpointId};
 use n0_future::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use zune_jpeg::JpegDecoder;
-use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
 
 use crate::capture::{Capturer, Geometry};
 use crate::config::Config;
@@ -99,8 +97,6 @@ pub struct Viewer {
     /// The remote user is using their own mouse/keyboard right now.
     pub remote_busy: bool,
     pub patches: Vec<Patch>,
-    /// Patches were dropped; the screen may be stale until the next full refresh.
-    pub needs_full: bool,
     pub bytes: u64,
     pub frames: u64,
     pub input: Option<mpsc::UnboundedSender<Input>>,
@@ -213,7 +209,6 @@ impl Net {
             direct: false,
             remote_busy: false,
             patches: Vec::new(),
-            needs_full: false,
             bytes: 0,
             frames: 0,
             input: None,
@@ -353,38 +348,56 @@ async fn run_viewer(
         }
     });
 
-    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    // H.264 decoding runs on its own thread: the decoder is not Send, and decoding a 1080p
+    // frame takes a few milliseconds that shouldn't block the network tasks.
+    let (dtx, drx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    {
+        let (viewer, ctx) = (viewer.clone(), ctx.clone());
+        std::thread::spawn(move || decode_loop(drx, viewer, ctx));
+    }
     loop {
         let buf = read_msg(&mut frames).await?;
-        let frame = Frame::decode(&buf)?;
-        let screen = [frame.screen_w as usize, frame.screen_h as usize];
-        let mut patches = Vec::with_capacity(frame.rects.len());
-        for r in frame.rects {
-            let rgba = JpegDecoder::new_with_options(ZCursor::new(&r.jpeg[..]), opts).decode()?;
-            let size = [r.w as usize, r.h as usize];
-            if rgba.len() == size[0] * size[1] * 4 {
-                patches.push(Patch { screen, pos: [r.x as usize, r.y as usize], size, rgba });
-            }
-        }
         let direct = conn.paths().iter().any(|p| p.is_selected() && p.is_ip());
+        {
+            let mut v = viewer.lock().unwrap();
+            if v.status != ViewStatus::Connected {
+                break;
+            }
+            v.bytes += buf.len() as u64;
+            v.direct = direct;
+        }
+        // If the decoder falls behind, drop frames here rather than queueing forever.
+        if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = dtx.try_send(buf) {
+            break;
+        }
+    }
+    clipboard.unsubscribe(clip_id);
+    Ok(())
+}
+
+/// Decodes H.264 frames into full-screen RGBA patches for the GUI.
+fn decode_loop(rx: std::sync::mpsc::Receiver<Vec<u8>>, viewer: Arc<Mutex<Viewer>>, ctx: egui::Context) {
+    use openh264::decoder::Decoder;
+    use openh264::formats::YUVSource;
+    let Ok(mut decoder) = Decoder::new() else { return };
+    let mut rgba: Vec<u8> = Vec::new();
+    while let Ok(buf) = rx.recv() {
+        let Ok(frame) = VideoFrame::decode(&buf) else { continue };
+        let Ok(Some(yuv)) = decoder.decode(&frame.data) else { continue };
+        let (w, h) = yuv.dimensions();
+        rgba.resize(w * h * 4, 0);
+        yuv.write_rgba8(&mut rgba);
         let mut v = viewer.lock().unwrap();
         if v.status != ViewStatus::Connected {
             break;
         }
-        // If the GUI isn't consuming patches (window minimised), keep only recent ones.
-        if v.patches.len() > 400 {
-            v.patches.clear();
-            v.needs_full = true;
-        }
-        v.patches.extend(patches);
-        v.bytes += buf.len() as u64;
+        // A decoded frame is the whole screen, so it supersedes anything not yet drawn.
+        v.patches.clear();
+        v.patches.push(Patch { screen: [w, h], pos: [0, 0], size: [w, h], rgba: rgba.clone() });
         v.frames += 1;
-        v.direct = direct;
         drop(v);
         ctx.request_repaint();
     }
-    clipboard.unsubscribe(clip_id);
-    Ok(())
 }
 
 /// Accepts either a 10-digit short ID or a full public key.

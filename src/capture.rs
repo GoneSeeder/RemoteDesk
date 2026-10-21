@@ -1,16 +1,25 @@
-//! Screen capture on the controlled machine. Each frame is compared with the previous one in
-//! 64px tiles; only changed tiles are sent, grouped into one JPEG per tile row.
+//! Screen capture on the controlled machine, encoded as H.264 video.
+//!
+//! Each captured frame is compared with the previous one; unchanged screens are not re-encoded,
+//! so an idle desktop costs almost nothing. Changed frames go through OpenH264 tuned for screen
+//! content, which sends only what changed and is far smaller than per-tile JPEG.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use jpeg_encoder::{ColorType, Encoder};
+use openh264::OpenH264API;
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
+use openh264::formats::{RgbaSliceU8, YUVBuffer};
 
-use crate::proto::{Frame, Rect};
+use crate::proto::VideoFrame;
 
-const TILE: usize = 64;
-const QUALITY: u8 = 70;
-const MIN_FRAME_TIME: Duration = Duration::from_millis(40); // ~25 fps cap
+/// Frame-rate cap. 30 fps feels smooth for desktop work without burning CPU.
+const FPS: f32 = 30.0;
+const MIN_FRAME_TIME: Duration = Duration::from_millis((1000.0 / FPS) as u64);
+/// Target bitrate. Screen content compresses well; this keeps text sharp on typical links.
+const BITRATE_BPS: u32 = 6_000_000;
+/// Send a full keyframe at least this often so a stalled decoder recovers quickly.
+const KEYFRAME_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 pub struct Geometry {
@@ -26,16 +35,35 @@ fn primary_monitor() -> Result<xcap::Monitor> {
     monitors.into_iter().nth(primary).context("no monitor found")
 }
 
+fn new_encoder() -> Result<Encoder> {
+    let config = EncoderConfig::new()
+        .bitrate(BitRate::from_bps(BITRATE_BPS))
+        .max_frame_rate(FrameRate::from_hz(FPS))
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .skip_frames(false);
+    Ok(Encoder::with_api_config(OpenH264API::from_source(), config)?)
+}
+
 pub struct Capturer {
     monitor: xcap::Monitor,
+    encoder: Option<Encoder>,
+    size: (usize, usize),
     prev: Vec<u8>,
-    prev_size: (usize, usize),
     last: Instant,
+    last_key: Instant,
 }
 
 impl Capturer {
     pub fn new() -> Result<Capturer> {
-        Ok(Capturer { monitor: primary_monitor()?, prev: Vec::new(), prev_size: (0, 0), last: Instant::now() - MIN_FRAME_TIME })
+        Ok(Capturer {
+            monitor: primary_monitor()?,
+            encoder: None,
+            size: (0, 0),
+            prev: Vec::new(),
+            last: Instant::now() - MIN_FRAME_TIME,
+            last_key: Instant::now(),
+        })
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -48,8 +76,8 @@ impl Capturer {
         }
     }
 
-    /// Blocks until the screen has changed (or a frame is due) and returns the changed regions.
-    pub fn next_frame(&mut self, stopped: &dyn Fn() -> bool) -> Result<Frame> {
+    /// Blocks until the screen has changed and returns it encoded as one H.264 access unit.
+    pub fn next_frame(&mut self, stopped: &dyn Fn() -> bool) -> Result<VideoFrame> {
         loop {
             if stopped() {
                 anyhow::bail!("session ended");
@@ -69,50 +97,47 @@ impl Capturer {
                     continue;
                 }
             };
-            let (w, h) = (img.width() as usize, img.height() as usize);
-            let rgba = img.into_raw();
-
-            let full = self.prev_size != (w, h);
-            let mut rects = Vec::new();
-            for ty in (0..h).step_by(TILE) {
-                let th = TILE.min(h - ty);
-                let (mut first, mut last) = (usize::MAX, 0);
-                for tx in (0..w).step_by(TILE) {
-                    let tw = TILE.min(w - tx);
-                    if full || tile_changed(&rgba, &self.prev, w, tx, ty, tw, th) {
-                        first = first.min(tx);
-                        last = tx + tw;
-                    }
-                }
-                if first != usize::MAX {
-                    rects.push(encode_rect(&rgba, w, first, ty, last - first, th)?);
-                }
+            let (full_w, full_h) = (img.width() as usize, img.height() as usize);
+            // YUV 4:2:0 needs even dimensions; drop a trailing column/row if odd.
+            let (w, h) = (full_w & !1, full_h & !1);
+            if w < 16 || h < 16 {
+                continue;
+            }
+            let mut rgba = img.into_raw();
+            if w != full_w || h != full_h {
+                rgba = crop(&rgba, full_w, w, h);
             }
 
+            let resized = self.size != (w, h);
+            let key_due = self.last_key.elapsed() >= KEYFRAME_EVERY;
+            if !resized && !key_due && rgba == self.prev {
+                continue; // nothing changed on screen
+            }
+            if resized || self.encoder.is_none() {
+                self.encoder = Some(new_encoder()?);
+                self.size = (w, h);
+            }
+            let encoder = self.encoder.as_mut().unwrap();
+            if resized || key_due {
+                encoder.force_intra_frame();
+                self.last_key = Instant::now();
+            }
+            let yuv = YUVBuffer::from_rgba8_source(RgbaSliceU8::new(&rgba, (w, h)));
+            let data = encoder.encode(&yuv)?.to_vec();
             self.prev = rgba;
-            self.prev_size = (w, h);
-            if !rects.is_empty() {
-                return Ok(Frame { screen_w: w as u16, screen_h: h as u16, rects });
+            if data.is_empty() {
+                continue;
             }
+            return Ok(VideoFrame { width: w as u16, height: h as u16, data });
         }
     }
 }
 
-fn tile_changed(cur: &[u8], prev: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: usize) -> bool {
-    let stride = stride_px * 4;
-    (y..y + h).any(|row| {
-        let start = row * stride + x * 4;
-        cur[start..start + w * 4] != prev[start..start + w * 4]
-    })
-}
-
-fn encode_rect(rgba: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: usize) -> Result<Rect> {
-    let mut sub = Vec::with_capacity(w * h * 4);
-    for row in y..y + h {
-        let start = (row * stride_px + x) * 4;
-        sub.extend_from_slice(&rgba[start..start + w * 4]);
+fn crop(rgba: &[u8], stride_px: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let start = row * stride_px * 4;
+        out.extend_from_slice(&rgba[start..start + w * 4]);
     }
-    let mut jpeg = Vec::new();
-    Encoder::new(&mut jpeg, QUALITY).encode(&sub, w as u16, h as u16, ColorType::Rgba)?;
-    Ok(Rect { x: x as u16, y: y as u16, w: w as u16, h: h as u16, jpeg })
+    out
 }

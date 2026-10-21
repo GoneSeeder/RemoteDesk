@@ -3,8 +3,15 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
+        // Publisher details shown in the exe's Properties > Details tab. File/product version
+        // come from Cargo.toml automatically.
         res.set("ProductName", "RemoteDesk");
-        res.set("FileDescription", "RemoteDesk");
+        res.set("FileDescription", "RemoteDesk - Remote Desktop");
+        res.set("CompanyName", "GoneSeeder");
+        res.set("LegalCopyright", "Copyright (C) 2026 GoneSeeder");
+        res.set("OriginalFilename", "RemoteDesk.exe");
+        res.set("InternalName", "RemoteDesk");
+        res.set("Comments", "https://github.com/GoneSeeder/RemoteDesk");
         // Release builds always run as administrator (Windows shows its UAC prompt on launch),
         // so remote input also reaches elevated windows such as Task Manager. Debug builds stay
         // unelevated so the headless self-test and preview run without prompts.

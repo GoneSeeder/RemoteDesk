@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/2";
+pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/3";
 pub const ALPN_PING: &[u8] = b"remotedesk/ping/1";
 
 pub const WRONG_PASSWORD: &str = "รหัสผ่านไม่ถูกต้อง";
@@ -83,59 +83,31 @@ pub enum HostMsg {
     LocalActive(bool),
 }
 
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub w: u16,
-    pub h: u16,
-    pub jpeg: Vec<u8>,
+/// One H.264 access unit of the remote screen.
+pub struct VideoFrame {
+    pub width: u16,
+    pub height: u16,
+    pub data: Vec<u8>,
 }
 
-pub struct Frame {
-    pub screen_w: u16,
-    pub screen_h: u16,
-    pub rects: Vec<Rect>,
-}
-
-impl Frame {
+impl VideoFrame {
     pub fn encode(&self) -> Vec<u8> {
-        let size: usize = 6 + self.rects.iter().map(|r| 12 + r.jpeg.len()).sum::<usize>();
-        let mut out = Vec::with_capacity(size);
-        out.extend_from_slice(&self.screen_w.to_le_bytes());
-        out.extend_from_slice(&self.screen_h.to_le_bytes());
-        out.extend_from_slice(&(self.rects.len() as u16).to_le_bytes());
-        for r in &self.rects {
-            for v in [r.x, r.y, r.w, r.h] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.extend_from_slice(&(r.jpeg.len() as u32).to_le_bytes());
-            out.extend_from_slice(&r.jpeg);
-        }
+        let mut out = Vec::with_capacity(4 + self.data.len());
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.data);
         out
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Frame> {
-        let mut pos = 0;
-        let mut take = |n: usize| -> Result<&[u8]> {
-            if pos + n > buf.len() {
-                bail!("truncated frame");
-            }
-            let s = &buf[pos..pos + n];
-            pos += n;
-            Ok(s)
-        };
-        let u16_at = |s: &[u8]| u16::from_le_bytes([s[0], s[1]]);
-        let screen_w = u16_at(take(2)?);
-        let screen_h = u16_at(take(2)?);
-        let n = u16_at(take(2)?);
-        let mut rects = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            let h = take(12)?;
-            let len = u32::from_le_bytes([h[8], h[9], h[10], h[11]]) as usize;
-            let (x, y, w, hh) = (u16_at(&h[0..]), u16_at(&h[2..]), u16_at(&h[4..]), u16_at(&h[6..]));
-            rects.push(Rect { x, y, w, h: hh, jpeg: take(len)?.to_vec() });
+    pub fn decode(buf: &[u8]) -> Result<VideoFrame> {
+        if buf.len() < 4 {
+            bail!("truncated frame");
         }
-        Ok(Frame { screen_w, screen_h, rects })
+        Ok(VideoFrame {
+            width: u16::from_le_bytes([buf[0], buf[1]]),
+            height: u16::from_le_bytes([buf[2], buf[3]]),
+            data: buf[4..].to_vec(),
+        })
     }
 }
 
