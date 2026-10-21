@@ -43,7 +43,10 @@ fn main() -> eframe::Result {
         if flag == "--preview" {
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    .with_inner_size([1100.0, 700.0])
+                    .with_inner_size([
+                        std::env::var("RD_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1100.0),
+                        std::env::var("RD_H").ok().and_then(|v| v.parse().ok()).unwrap_or(700.0),
+                    ])
                     .with_icon(icon())
                     .with_position([-32000.0, -32000.0])
                     .with_taskbar(false)
@@ -59,7 +62,7 @@ fn main() -> eframe::Result {
             .with_title("RemoteDesk")
             .with_icon(icon())
             .with_inner_size([960.0, 600.0])
-            .with_min_inner_size([720.0, 460.0]),
+            .with_min_inner_size([480.0, 440.0]),
         ..Default::default()
     };
     eframe::run_native("RemoteDesk", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)?))))

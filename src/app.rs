@@ -284,7 +284,8 @@ impl App {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(32, 24)).show(ui, |ui| {
+                let pad = if ui.available_width() < 720.0 { 14 } else { 32 };
+                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(pad, 24)).show(ui, |ui| {
                     self.hero(ui);
                     ui.add_space(28.0);
                     self.cards(ui);
@@ -348,17 +349,22 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_width() < 720.0;
         ui.horizontal_centered(|ui| {
             ui.add(egui::Image::from_texture((self.logo.id(), vec2(30.0, 30.0))));
-            ui.label(RichText::new("RemoteDesk").font(bold(17.0)).color(TEXT));
-            ui.label(RichText::new(format!("v{}", updater::VERSION)).color(MUTED).size(12.0));
-            ui.add_space(24.0);
+            if !compact {
+                ui.label(RichText::new("RemoteDesk").font(bold(17.0)).color(TEXT));
+                ui.label(RichText::new(format!("v{}", updater::VERSION)).color(MUTED).size(12.0));
+            }
+            ui.add_space(if compact { 8.0 } else { 24.0 });
+            // Leave room for the connect button, status and settings on the right.
+            let reserved = if compact { 210.0 } else { 330.0 };
 
             let edit = egui::TextEdit::singleline(&mut self.address)
                 .hint_text("ใส่ ID เครื่องปลายทาง เช่น 1 234 567 890")
                 .font(FontId::proportional(16.0))
                 .margin(vec2(12.0, 8.0))
-                .desired_width((ui.available_width() - 330.0).clamp(220.0, 520.0));
+                .desired_width((ui.available_width() - reserved).clamp(120.0, 520.0));
             let resp = ui.add(edit);
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if accent_button(ui, "เชื่อมต่อ").clicked() || enter {
@@ -375,7 +381,9 @@ impl App {
                 }
                 ui.add_space(8.0);
                 let online = self.net.shared.lock().unwrap().online;
-                ui.label(RichText::new(if online { "ออนไลน์" } else { "กำลังเชื่อมต่อ..." }).color(MUTED));
+                if !compact {
+                    ui.label(RichText::new(if online { "ออนไลน์" } else { "กำลังเชื่อมต่อ..." }).color(MUTED));
+                }
                 dot(ui, if online { GREEN } else { AMBER }, 10.0);
             });
         });
@@ -403,7 +411,8 @@ impl App {
             .inner_margin(egui::Margin::symmetric(28, 22))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                let narrow = ui.available_width() < 640.0;
+                let body = |ui: &mut egui::Ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("ID ของเครื่องนี้").color(MUTED).size(14.0));
                         match &short {
@@ -444,13 +453,17 @@ impl App {
                             ui.label(RichText::new("ส่ง ID และรหัสผ่านให้คนที่จะเข้ามาควบคุม").color(MUTED).size(13.0));
                         });
                     });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let side = if narrow { Layout::top_down(Align::Min) } else { Layout::right_to_left(Align::Center) };
+                    if narrow {
+                        ui.add_space(12.0);
+                    }
+                    ui.with_layout(side, |ui| {
                         egui::Frame::NONE
                             .fill(SURFACE2)
                             .corner_radius(10)
                             .inner_margin(egui::Margin::symmetric(16, 12))
                             .show(ui, |ui| {
-                                ui.set_width(300.0);
+                                ui.set_width(if narrow { ui.available_width() } else { 300.0 });
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new("รหัสผ่าน").color(MUTED).size(13.0));
                                     let shown = if self.show_pw { password.clone() } else { "•".repeat(password.chars().count()) };
@@ -478,7 +491,12 @@ impl App {
                                 });
                             });
                     });
-                });
+                };
+                if narrow {
+                    ui.vertical(body);
+                } else {
+                    ui.horizontal(body);
+                }
             });
         if let Some(err) = &self.error {
             ui.add_space(10.0);
@@ -523,11 +541,17 @@ impl App {
         }
 
         let mut connect = None;
+        // As many columns as fit; stretch cards so the row fills the width.
+        let gap = 14.0;
+        let avail = ui.available_width();
+        let cols = ((avail + gap) / (CARD.x + gap)).floor().max(1.0);
+        let w = ((avail - gap * (cols - 1.0)) / cols).min(340.0);
+        let card_size = vec2(w, w * CARD.y / CARD.x);
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(14.0, 14.0);
+            ui.spacing_mut().item_spacing = vec2(gap, gap);
             for c in &contacts {
                 let p = presence.get(&c.id).cloned();
-                if let Some(action) = self.card(ui, c, p) {
+                if let Some(action) = self.card(ui, c, p, card_size) {
                     match action {
                         CardAction::Connect => connect = Some(c.clone()),
                         CardAction::Delete => self.confirm_delete = Some(c.clone()),
@@ -543,8 +567,8 @@ impl App {
         }
     }
 
-    fn card(&mut self, ui: &mut egui::Ui, c: &Contact, presence: Option<Presence>) -> Option<CardAction> {
-        let (rect, resp) = ui.allocate_exact_size(CARD, Sense::click());
+    fn card(&mut self, ui: &mut egui::Ui, c: &Contact, presence: Option<Presence>, size: Vec2) -> Option<CardAction> {
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         let painter = ui.painter_at(rect.expand(2.0));
         let radius = CornerRadius::same(12);
@@ -560,11 +584,11 @@ impl App {
         let tint = if offline { Color32::from_gray(150) } else { Color32::WHITE };
         if let Some(tex) = self.thumb(ui.ctx(), &c.id) {
             let [tw, th] = tex.size();
-            let uv = cover_uv(tw as f32 / th as f32, CARD.x / CARD.y);
-            egui::Image::from_texture((tex.id(), CARD)).uv(uv).corner_radius(radius).tint(tint).paint_at(ui, rect);
+            let uv = cover_uv(tw as f32 / th as f32, size.x / size.y);
+            egui::Image::from_texture((tex.id(), size)).uv(uv).corner_radius(radius).tint(tint).paint_at(ui, rect);
         } else {
             let tex = self.gradient(ui.ctx(), &c.id);
-            egui::Image::from_texture((tex.id(), CARD)).corner_radius(radius).tint(tint).paint_at(ui, rect);
+            egui::Image::from_texture((tex.id(), size)).corner_radius(radius).tint(tint).paint_at(ui, rect);
         }
 
         // Bottom caption strip.
@@ -930,6 +954,7 @@ impl App {
             .exact_size(46.0)
             .frame(egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::symmetric(14, 0)))
             .show(ui, |ui| {
+                let wide = ui.available_width() > 900.0;
                 ui.horizontal_centered(|ui| {
                     let (icon, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                     monitor_icon(ui.painter(), icon.center(), TEXT);
@@ -940,14 +965,16 @@ impl App {
                     ui.add_space(10.0);
                     let (c, t) = if direct { (GREEN, "เชื่อมต่อตรง") } else { (AMBER, "ผ่าน Relay") };
                     pill(ui, c, t);
-                    if crate::localinput::key_capture_active() {
+                    if wide && crate::localinput::key_capture_active() {
                         ui.label(RichText::new("คีย์ลัดทั้งหมดส่งไปเครื่องปลายทาง").color(MUTED).size(12.5))
                             .on_hover_text("รวมถึงปุ่ม Win และ Alt+Tab คลิกนอกหน้าต่างเพื่อใช้คีย์บอร์ดกับเครื่องตัวเอง");
                     }
                     if remote_busy {
                         pill(ui, AMBER, "ปลายทางกำลังใช้เมาส์/คีย์บอร์ดเอง");
                     }
-                    ui.label(RichText::new(format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)).color(MUTED).size(13.0));
+                    if wide {
+                        ui.label(RichText::new(format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)).color(MUTED).size(13.0));
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if danger_button(ui, "ตัดการเชื่อมต่อ").clicked() {
                             disconnect = true;
