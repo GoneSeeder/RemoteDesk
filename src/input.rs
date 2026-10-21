@@ -4,7 +4,15 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 use crate::capture::Geometry;
 use crate::proto::Input;
@@ -27,16 +35,73 @@ pub fn spawn() -> Sender<Cmd> {
     tx
 }
 
+/// Small diagnostic log on the controlled machine: `%APPDATA%\RemoteDesk\input.log`.
+fn log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::var_os("APPDATA").map(std::path::PathBuf::from).unwrap_or_default().join("RemoteDesk").join("input.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 512 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(f, "{t} {msg}");
+    }
+}
+
+fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: i32) -> bool {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
+}
+
+/// Moves the cursor to physical pixel (x, y) anywhere on the virtual desktop.
+fn mouse_to(x: i32, y: i32) -> bool {
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        )
+    };
+    let nx = ((x - vx) as i64 * 65535 / (vw - 1) as i64) as i32;
+    let ny = ((y - vy) as i64 * 65535 / (vh - 1) as i64) as i32;
+    send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0)
+}
+
+fn button_flags(button: u8, down: bool) -> MOUSE_EVENT_FLAGS {
+    match (button, down) {
+        (1, true) => MOUSEEVENTF_RIGHTDOWN,
+        (1, false) => MOUSEEVENTF_RIGHTUP,
+        (2, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (2, false) => MOUSEEVENTF_MIDDLEUP,
+        (_, true) => MOUSEEVENTF_LEFTDOWN,
+        (_, false) => MOUSEEVENTF_LEFTUP,
+    }
+}
+
 fn run(rx: Receiver<Cmd>) {
-    let Ok(mut enigo) = Enigo::new(&Settings::default()) else { return };
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            log(&format!("keyboard init failed: {e:?}"));
+            None
+        }
+    };
+    log("input thread started");
     let mut mods = [false; 3]; // ctrl, shift, alt as currently held by us
     let mut held_keys: Vec<u16> = Vec::new();
-    let mut held_buttons: Vec<Button> = Vec::new();
+    let mut held_buttons: Vec<u8> = Vec::new();
+    let (mut received, mut paused, mut failed) = (0u64, 0u64, 0u64);
 
-    let set_mod = |enigo: &mut Enigo, held: &mut bool, vk: u16, want: bool| {
+    let set_mod = |enigo: &mut Option<Enigo>, held: &mut bool, vk: u16, want: bool| {
         if *held != want {
             let dir = if want { Direction::Press } else { Direction::Release };
-            let _ = enigo.key(Key::Other(vk as u32), dir);
+            if let Some(e) = enigo {
+                let _ = e.key(Key::Other(vk as u32), dir);
+            }
             *held = want;
         }
     };
@@ -49,41 +114,55 @@ fn run(rx: Receiver<Cmd>) {
                 ev,
                 Input::MouseMove { .. } | Input::Scroll { .. } | Input::Button { down: true, .. } | Input::Key { down: true, .. } | Input::Text(_)
             );
+            received += 1;
             if press && crate::localinput::local_active() {
+                paused += 1;
+                if paused % 50 == 1 {
+                    log(&format!("paused: local user active (paused={paused} received={received})"));
+                }
                 continue;
+            }
+            if received % 500 == 1 {
+                log(&format!("inputs received={received} paused={paused} failed={failed}"));
             }
         }
         match cmd {
             Cmd::Input(g, Input::MouseMove { x, y }) => {
                 let px = g.x + (x.clamp(0.0, 1.0) * (g.w.saturating_sub(1)) as f32).round() as i32;
                 let py = g.y + (y.clamp(0.0, 1.0) * (g.h.saturating_sub(1)) as f32).round() as i32;
-                let _ = enigo.move_mouse(px, py, Coordinate::Abs);
+                if !mouse_to(px, py) {
+                    failed += 1;
+                    if failed % 50 == 1 {
+                        log(&format!("SendInput(move) failed, error {}", std::io::Error::last_os_error()));
+                    }
+                }
             }
             Cmd::Input(_, Input::Button { button, down }) => {
-                let b = match button {
-                    1 => Button::Right,
-                    2 => Button::Middle,
-                    _ => Button::Left,
-                };
-                let _ = enigo.button(b, if down { Direction::Press } else { Direction::Release });
-                held_buttons.retain(|&h| h != b);
+                if !send_mouse(button_flags(button, down), 0, 0, 0) {
+                    failed += 1;
+                    log(&format!("SendInput(button) failed, error {}", std::io::Error::last_os_error()));
+                }
+                held_buttons.retain(|&h| h != button);
                 if down {
-                    held_buttons.push(b);
+                    held_buttons.push(button);
                 }
             }
             Cmd::Input(_, Input::Scroll { dx, dy }) => {
+                // Our dy is positive for "scroll down"; Windows wheel delta is positive for up.
                 if dy != 0 {
-                    let _ = enigo.scroll(dy, Axis::Vertical);
+                    send_mouse(MOUSEEVENTF_WHEEL, 0, 0, -dy * 120);
                 }
                 if dx != 0 {
-                    let _ = enigo.scroll(dx, Axis::Horizontal);
+                    send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, dx * 120);
                 }
             }
             Cmd::Input(_, Input::Key { vk, down, ctrl, shift, alt }) => {
                 set_mod(&mut enigo, &mut mods[0], VK_CONTROL, ctrl);
                 set_mod(&mut enigo, &mut mods[1], VK_SHIFT, shift);
                 set_mod(&mut enigo, &mut mods[2], VK_MENU, alt);
-                let _ = enigo.key(Key::Other(vk as u32), if down { Direction::Press } else { Direction::Release });
+                if let Some(e) = &mut enigo {
+                    let _ = e.key(Key::Other(vk as u32), if down { Direction::Press } else { Direction::Release });
+                }
                 held_keys.retain(|&k| k != vk);
                 if down {
                     held_keys.push(vk);
@@ -93,15 +172,19 @@ fn run(rx: Receiver<Cmd>) {
                 set_mod(&mut enigo, &mut mods[0], VK_CONTROL, false);
                 set_mod(&mut enigo, &mut mods[1], VK_SHIFT, false);
                 set_mod(&mut enigo, &mut mods[2], VK_MENU, false);
-                let _ = enigo.text(&text);
+                if let Some(e) = &mut enigo {
+                    let _ = e.text(&text);
+                }
             }
             Cmd::Input(_, Input::Clipboard(_)) => {}
             Cmd::Reset => {
                 for vk in held_keys.drain(..) {
-                    let _ = enigo.key(Key::Other(vk as u32), Direction::Release);
+                    if let Some(e) = &mut enigo {
+                        let _ = e.key(Key::Other(vk as u32), Direction::Release);
+                    }
                 }
                 for b in held_buttons.drain(..) {
-                    let _ = enigo.button(b, Direction::Release);
+                    send_mouse(button_flags(b, false), 0, 0, 0);
                 }
                 set_mod(&mut enigo, &mut mods[0], VK_CONTROL, false);
                 set_mod(&mut enigo, &mut mods[1], VK_SHIFT, false);

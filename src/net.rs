@@ -80,6 +80,8 @@ pub struct Viewer {
     /// The remote user is using their own mouse/keyboard right now.
     pub remote_busy: bool,
     pub patches: Vec<Patch>,
+    /// Patches were dropped; the screen may be stale until the next full refresh.
+    pub needs_full: bool,
     pub bytes: u64,
     pub frames: u64,
     pub input: Option<mpsc::UnboundedSender<Input>>,
@@ -191,6 +193,7 @@ impl Net {
             direct: false,
             remote_busy: false,
             patches: Vec::new(),
+            needs_full: false,
             bytes: 0,
             frames: 0,
             input: None,
@@ -299,6 +302,11 @@ async fn run_viewer(
     }
     {
         let mut v = viewer.lock().unwrap();
+        if v.status == ViewStatus::Closed {
+            // The user pressed cancel while we were still connecting.
+            conn.close(0u32.into(), b"cancelled");
+            return Ok(());
+        }
         v.status = ViewStatus::Connected;
         v.peer_name = welcome.name;
         v.peer_short = welcome.short;
@@ -332,6 +340,11 @@ async fn run_viewer(
         let mut v = viewer.lock().unwrap();
         if v.status != ViewStatus::Connected {
             break;
+        }
+        // If the GUI isn't consuming patches (window minimised), keep only recent ones.
+        if v.patches.len() > 400 {
+            v.patches.clear();
+            v.needs_full = true;
         }
         v.patches.extend(patches);
         v.bytes += buf.len() as u64;
@@ -488,7 +501,7 @@ async fn serve_control(
     let geo = geometry.clone();
     std::thread::spawn(move || {
         let Ok(mut capturer) = Capturer::new() else { return };
-        while let Ok(frame) = capturer.next_frame() {
+        while let Ok(frame) = capturer.next_frame(&|| ftx.is_closed()) {
             *geo.lock().unwrap() = capturer.geometry();
             if ftx.blocking_send(frame.encode()).is_err() {
                 break;

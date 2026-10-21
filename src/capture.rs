@@ -49,8 +49,11 @@ impl Capturer {
     }
 
     /// Blocks until the screen has changed (or a frame is due) and returns the changed regions.
-    pub fn next_frame(&mut self) -> Result<Frame> {
+    pub fn next_frame(&mut self, stopped: &dyn Fn() -> bool) -> Result<Frame> {
         loop {
+            if stopped() {
+                anyhow::bail!("session ended");
+            }
             let since = self.last.elapsed();
             if since < MIN_FRAME_TIME {
                 std::thread::sleep(MIN_FRAME_TIME - since);

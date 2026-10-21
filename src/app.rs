@@ -369,6 +369,18 @@ impl App {
                                 });
                             }
                         }
+                        if !crate::localinput::is_elevated() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                dot(ui, AMBER, 8.0);
+                                ui.label(RichText::new("สิทธิ์จำกัด").color(AMBER).size(12.5)).on_hover_text(
+                                    "คนที่เข้ามาคุมจะคลิกหรือพิมพ์ในโปรแกรมที่รันแบบผู้ดูแลระบบไม่ได้ เช่น Task Manager หรือตัวติดตั้งโปรแกรม",
+                                );
+                                if ui.small_button("เปิดแบบผู้ดูแลระบบ").clicked() && crate::localinput::relaunch_as_admin() {
+                                    std::process::exit(0);
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             if let Some(s) = &short {
                                 if ui.add(egui::Button::new("คัดลอก ID").min_size(vec2(0.0, 28.0))).clicked() {
@@ -384,7 +396,7 @@ impl App {
                             .corner_radius(10)
                             .inner_margin(egui::Margin::symmetric(16, 12))
                             .show(ui, |ui| {
-                                ui.set_width(230.0);
+                                ui.set_width(300.0);
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new("รหัสผ่าน").color(MUTED).size(13.0));
                                     let shown = if self.show_pw { password.clone() } else { "•".repeat(password.chars().count()) };
@@ -395,6 +407,13 @@ impl App {
                                         }
                                         if ui.small_button("คัดลอก").clicked() {
                                             ui.ctx().copy_text(password.clone());
+                                        }
+                                        if ui.small_button("ตั้งเอง").clicked() {
+                                            let sh = self.net.shared.lock().unwrap();
+                                            self.settings = Some(SettingsDraft {
+                                                name: sh.cfg.device_name.clone(),
+                                                password: sh.cfg.password.clone(),
+                                            });
                                         }
                                         if ui.small_button("สุ่มใหม่").clicked() {
                                             let mut sh = self.net.shared.lock().unwrap();

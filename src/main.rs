@@ -117,6 +117,23 @@ fn selftest(log_path: &str) {
     };
     writeln!(log, "wrong password -> {status} after {t:?}").ok();
 
+    // Cancel while connecting: nothing may keep streaming afterwards.
+    let c = ctl.connect(shortid::format(&short), password.clone());
+    std::thread::sleep(Duration::from_millis(300));
+    c.lock().unwrap().disconnect();
+    std::thread::sleep(Duration::from_secs(12));
+    {
+        let cv = c.lock().unwrap();
+        writeln!(
+            log,
+            "cancel while connecting: status_closed={} frames_after_cancel={} pending_patches={} host_sessions={}",
+            cv.status == net::ViewStatus::Closed,
+            cv.frames,
+            cv.patches.len(),
+            host.shared.lock().unwrap().incoming.len()
+        )
+        .ok();
+    }
     let resolve_start = Instant::now();
     let v = ctl.connect(shortid::format(&short), password);
     let t = wait(&|| v.lock().unwrap().frames >= 1, 60);

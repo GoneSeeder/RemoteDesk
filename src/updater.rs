@@ -171,14 +171,21 @@ pub fn sign_cli(exe: &str, key_file: &str) -> Result<()> {
     let key_hex = std::env::var("REMOTEDESK_SIGNING_KEY").ok().filter(|k| !k.trim().is_empty())
         .map(Ok)
         .unwrap_or_else(|| std::fs::read_to_string(key_file))?;
-    let key_hex = key_hex.trim();
+    // Never print the key itself, only what is wrong with it.
+    let key_hex: String = key_hex.chars().filter(|c| !c.is_whitespace()).collect();
+    if key_hex.is_empty() {
+        bail!("signing key is empty (is the REMOTEDESK_SIGNING_KEY secret set?)");
+    }
+    if key_hex.len() != 64 || !key_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("signing key must be exactly 64 hex characters, got {} characters", key_hex.len());
+    }
     let mut key = [0u8; 32];
     for (i, b) in key.iter_mut().enumerate() {
         *b = u8::from_str_radix(&key_hex[i * 2..i * 2 + 2], 16)?;
     }
     let secret = iroh::SecretKey::from_bytes(&key);
     if secret.public().to_string() != UPDATE_PUBLIC_KEY {
-        bail!("signing key does not match the public key built into this version");
+        bail!("signing key is valid hex but does not match the public key built into the app (wrong key pasted?)");
     }
     let data = std::fs::read(exe)?;
     let sig: String = secret.sign(&data).to_bytes().iter().map(|b| format!("{b:02x}")).collect();

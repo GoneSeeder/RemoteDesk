@@ -46,6 +46,30 @@ pub fn start() {
     });
 }
 
+/// Whether this process runs as administrator. Without it, Windows blocks our clicks and keys
+/// from reaching windows that run elevated (Task Manager, installers, "Run as administrator" apps).
+pub fn is_elevated() -> bool {
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+/// Restarts this program with administrator rights (Windows shows its UAC prompt).
+pub fn relaunch_as_admin() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (verb, file) = (wide("runas"), wide(&exe.to_string_lossy()));
+    let r = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    r as isize > 32
+}
+
 /// True while the local user has priority.
 pub fn local_active() -> bool {
     let last = LAST_LOCAL.load(Ordering::Relaxed);
