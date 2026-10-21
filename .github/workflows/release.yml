@@ -1,0 +1,41 @@
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to build, sign and publish a
+# release. Installed copies of RemoteDesk pick it up automatically.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"; exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Sign
+        shell: bash
+        env:
+          REMOTEDESK_SIGNING_KEY: ${{ secrets.REMOTEDESK_SIGNING_KEY }}
+        run: |
+          cp target/release/remotedesk.exe RemoteDesk.exe
+          ./RemoteDesk.exe --sign RemoteDesk.exe unused
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" RemoteDesk.exe RemoteDesk.exe.sig --generate-notes --title "RemoteDesk $GITHUB_REF_NAME"
