@@ -71,6 +71,19 @@ struct Session {
 struct SettingsDraft {
     name: String,
     password: String,
+    ask_on_connect: bool,
+    start_with_windows: bool,
+}
+
+impl SettingsDraft {
+    fn from_cfg(cfg: &crate::config::Config) -> SettingsDraft {
+        SettingsDraft {
+            name: cfg.device_name.clone(),
+            password: cfg.password.clone(),
+            ask_on_connect: cfg.ask_on_connect,
+            start_with_windows: cfg.start_with_windows,
+        }
+    }
 }
 
 pub struct App {
@@ -100,6 +113,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<App, Box<dyn std::error::Error + Send + Sync>> {
         setup_style(&cc.egui_ctx);
         let net = Net::start(crate::config::Config::load(), cc.egui_ctx.clone())?;
+        // Keep the Windows Run entry in sync with the saved setting.
+        crate::autostart::set_enabled(net.shared.lock().unwrap().cfg.start_with_windows);
         let updater = Updater::start(net.runtime(), cc.egui_ctx.clone());
         Ok(App {
             capturing_keys: false,
@@ -172,7 +187,7 @@ impl App {
                     focus: false,
                 })
             }
-            "settings" => app.settings = Some(SettingsDraft { name: "DESKTOP-Q4221RT".into(), password: "k7m2p9xa".into() }),
+            "settings" => app.settings = Some(SettingsDraft { name: "DESKTOP-Q4221RT".into(), password: "k7m2p9xa".into(), ..Default::default() }),
             _ => {}
         }
         app
@@ -377,7 +392,7 @@ impl App {
                 if ui.add(egui::Button::new("ตั้งค่า").min_size(vec2(0.0, 34.0))).clicked() {
                     let sh = self.net.shared.lock().unwrap();
                     self.settings =
-                        Some(SettingsDraft { name: sh.cfg.device_name.clone(), password: sh.cfg.password.clone() });
+                        Some(SettingsDraft::from_cfg(&sh.cfg));
                 }
                 ui.add_space(8.0);
                 let online = self.net.shared.lock().unwrap().online;
@@ -477,10 +492,7 @@ impl App {
                                         }
                                         if ui.small_button("ตั้งเอง").clicked() {
                                             let sh = self.net.shared.lock().unwrap();
-                                            self.settings = Some(SettingsDraft {
-                                                name: sh.cfg.device_name.clone(),
-                                                password: sh.cfg.password.clone(),
-                                            });
+                                            self.settings = Some(SettingsDraft::from_cfg(&sh.cfg));
                                         }
                                         if ui.small_button("สุ่มใหม่").clicked() {
                                             let mut sh = self.net.shared.lock().unwrap();
@@ -758,7 +770,21 @@ impl App {
             if draft.password.chars().count() < 4 {
                 ui.colored_label(AMBER, "รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร");
             }
-            ui.add_space(8.0);
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.checkbox(&mut draft.start_with_windows, "เปิดโปรแกรมอัตโนมัติเมื่อเปิด Windows");
+            ui.checkbox(&mut draft.ask_on_connect, "ถามก่อนทุกครั้งที่มีคนขอเข้าควบคุม");
+            ui.label(RichText::new("ถ้าเปิด ต้องมีคนที่หน้าเครื่องกดอนุญาต การเข้าแบบไม่มีคนดูแลจะใช้ไม่ได้").color(MUTED).size(11.5));
+            ui.add_space(6.0);
+            if ui.link(RichText::new("เปิดบันทึกการเข้าใช้งาน (access.log)").size(12.5)).clicked() {
+                let path = crate::config::config_dir().join("access.log");
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+                let _ = std::process::Command::new("notepad").arg(path).spawn();
+            }
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
             ui.label(RichText::new(format!("เวอร์ชัน {}", updater::VERSION)).color(MUTED).size(12.0));
             ui.add_space(4.0);
             ui.label(RichText::new("ID ถาวรของเครื่องนี้").color(MUTED));
@@ -785,10 +811,15 @@ impl App {
             });
         });
         if save {
+            let start = draft.start_with_windows;
             let mut sh = self.net.shared.lock().unwrap();
             sh.cfg.device_name = draft.name.trim().to_string();
             sh.cfg.password = draft.password.clone();
+            sh.cfg.ask_on_connect = draft.ask_on_connect;
+            sh.cfg.start_with_windows = start;
             sh.cfg.save();
+            drop(sh);
+            crate::autostart::set_enabled(start);
         }
         if save || close || modal.should_close() {
             self.settings = None;
@@ -1137,6 +1168,7 @@ impl eframe::App for App {
             self.home_ui(ui);
         }
         self.transfers_ui(ui.ctx());
+        self.access_request_dialog(ui.ctx());
         self.update_key_capture(ui.ctx());
     }
 }
@@ -1144,6 +1176,40 @@ impl eframe::App for App {
 impl App {
     /// Grabs the whole keyboard (Win, Alt+Tab, ...) while a connected session window is focused
     /// and no dialog is open; releases it the moment that stops being true.
+    /// Shows the oldest pending "allow this person?" prompt (when ask-on-connect is on).
+    fn access_request_dialog(&mut self, ctx: &egui::Context) {
+        let pending = {
+            let sh = self.net.shared.lock().unwrap();
+            sh.requests.first().map(|r| (r.id, r.name.clone(), r.peer.clone()))
+        };
+        let Some((id, name, peer)) = pending else { return };
+        let mut answer: Option<bool> = None;
+        egui::Modal::new(egui::Id::unique("access")).frame(dialog_frame()).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("มีคนขอเข้าควบคุมเครื่องนี้").font(bold(18.0)));
+            ui.add_space(6.0);
+            ui.label(RichText::new(&name).font(bold(15.0)));
+            ui.label(RichText::new(format!("ID {}…", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new("อนุญาตให้ควบคุมเครื่องนี้หรือไม่? (รหัสผ่านถูกต้องแล้ว)").color(MUTED).size(13.0));
+            ui.add_space(14.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if accent_button(ui, "อนุญาต").clicked() {
+                    answer = Some(true);
+                }
+                if danger_button(ui, "ปฏิเสธ").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if let Some(allow) = answer {
+            let mut sh = self.net.shared.lock().unwrap();
+            if let Some(req) = sh.requests.iter_mut().find(|r| r.id == id) {
+                req.answer(allow);
+            }
+        }
+    }
+
     fn update_key_capture(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
         let tx = self.session.as_ref().and_then(|s| {

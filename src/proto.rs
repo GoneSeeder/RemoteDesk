@@ -11,6 +11,8 @@ pub const ALPN_PING: &[u8] = b"remotedesk/ping/1";
 
 pub const WRONG_PASSWORD: &str = "รหัสผ่านไม่ถูกต้อง";
 pub const NOT_FOUND: &str = "ไม่พบเครื่องนี้ (ID ผิด หรือเครื่องปลายทางไม่ได้เปิดโปรแกรม)";
+pub const DENIED: &str = "เครื่องปลายทางปฏิเสธการเชื่อมต่อ";
+pub const LOCKED: &str = "ใส่รหัสผิดหลายครั้ง ถูกล็อกชั่วคราว กรุณาลองใหม่ภายหลัง";
 
 const MAX_MSG: usize = 32 * 1024 * 1024;
 

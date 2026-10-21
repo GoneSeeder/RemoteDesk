@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::input::{self, Cmd};
 use crate::proto::*;
 use crate::shortid;
+use crate::security;
 use crate::transfer::{self, Clipboard, Transfers};
 
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(10);
@@ -52,6 +53,24 @@ pub struct Shared {
     pub incoming: Vec<Incoming>,
     pub transfers: Transfers,
     pub clipboard: Clipboard,
+    /// Incoming sessions waiting for the local user to allow or deny them.
+    pub requests: Vec<AccessRequest>,
+}
+
+/// One pending "allow this person to control me?" prompt.
+pub struct AccessRequest {
+    pub id: u64,
+    pub name: String,
+    pub peer: String,
+    reply: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+impl AccessRequest {
+    pub fn answer(&mut self, allow: bool) {
+        if let Some(tx) = self.reply.take() {
+            let _ = tx.send(allow);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -135,6 +154,7 @@ impl Net {
             incoming: Vec::new(),
             transfers: Transfers::default(),
             clipboard: Clipboard::start(),
+            requests: Vec::new(),
         }));
         let input = input::spawn();
 
@@ -473,19 +493,66 @@ async fn serve_control(
     let nonce: String = (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
     write_json(&mut send, &Challenge { nonce: nonce.clone() }).await?;
     let auth: Auth = timeout(Duration::from_secs(15), read_json(&mut recv)).await??;
-    let (expected, my_name, short, my_id) = {
+    let peer = conn.remote_id().to_string();
+    let (expected, my_name, short, my_id, ask) = {
         let s = shared.lock().unwrap();
-        (s.cfg.password.clone(), s.cfg.device_name.clone(), s.short_id.clone().unwrap_or_default(), s.my_id.clone())
+        (
+            s.cfg.password.clone(),
+            s.cfg.device_name.clone(),
+            s.short_id.clone().unwrap_or_default(),
+            s.my_id.clone(),
+            s.cfg.ask_on_connect,
+        )
     };
-    let wanted = auth_proof(&expected, &nonce, &my_id, &conn.remote_id().to_string());
-    if expected.is_empty() || auth.proof != wanted {
-        // Slow down password guessing.
-        sleep(Duration::from_secs(2)).await;
-        write_json(&mut send, &Welcome { ok: false, msg: WRONG_PASSWORD.into(), name: my_name, short }).await?;
+
+    // Locked out from too many wrong passwords?
+    if let Some(remaining) = security::lockout_remaining(&peer) {
+        security::log("locked", &peer, &hello.name, &format!("{}s remaining", remaining.as_secs()));
+        write_json(&mut send, &Welcome { ok: false, msg: LOCKED.into(), name: my_name, short }).await?;
         send.finish()?;
         let _ = timeout(Duration::from_secs(3), conn.closed()).await;
         return Ok(());
     }
+
+    let wanted = auth_proof(&expected, &nonce, &my_id, &peer);
+    if expected.is_empty() || auth.proof != wanted {
+        let lock = security::record_failure(&peer);
+        let detail = lock.map(|d| format!("locked for {}s", d.as_secs())).unwrap_or_default();
+        security::log("wrong-password", &peer, &hello.name, &detail);
+        // Slow down password guessing.
+        sleep(Duration::from_secs(2)).await;
+        let msg = if lock.is_some() { LOCKED } else { WRONG_PASSWORD };
+        write_json(&mut send, &Welcome { ok: false, msg: msg.into(), name: my_name, short }).await?;
+        send.finish()?;
+        let _ = timeout(Duration::from_secs(3), conn.closed()).await;
+        return Ok(());
+    }
+    security::record_success(&peer);
+
+    // Optional: ask the person at this machine to allow the session.
+    if ask {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req_id = session;
+        shared.lock().unwrap().requests.push(AccessRequest {
+            id: req_id,
+            name: hello.name.clone(),
+            peer: peer.clone(),
+            reply: Some(tx),
+        });
+        ctx.request_repaint();
+        let allowed = timeout(Duration::from_secs(30), rx).await.ok().and_then(|r| r.ok()).unwrap_or(false);
+        shared.lock().unwrap().requests.retain(|r| r.id != req_id);
+        ctx.request_repaint();
+        if !allowed {
+            security::log("denied", &peer, &hello.name, "");
+            write_json(&mut send, &Welcome { ok: false, msg: DENIED.into(), name: my_name, short }).await?;
+            send.finish()?;
+            let _ = timeout(Duration::from_secs(3), conn.closed()).await;
+            return Ok(());
+        }
+    }
+
+    security::log("connected", &peer, &hello.name, "");
     write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short }).await?;
 
     shared.lock().unwrap().incoming.push(Incoming {
@@ -569,5 +636,6 @@ async fn serve_control(
         _ = conn.closed() => {}
     }
     clipboard.unsubscribe(clip_id);
+    security::log("disconnected", &peer, &peer_name, "");
     Ok(())
 }

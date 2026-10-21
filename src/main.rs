@@ -9,6 +9,8 @@ mod net;
 mod proto;
 mod shortid;
 mod transfer;
+mod autostart;
+mod security;
 mod updater;
 
 use eframe::egui;
@@ -138,7 +140,7 @@ fn selftest(log_path: &str) {
         .ok();
     }
     let resolve_start = Instant::now();
-    let v = ctl.connect(shortid::format(&short), password);
+    let v = ctl.connect(shortid::format(&short), password.clone());
     let t = wait(&|| v.lock().unwrap().frames >= 1, 60);
     writeln!(log, "first frame via short id after {t:?} (total {:?}), status ok={}", resolve_start.elapsed(), v.lock().unwrap().status == net::ViewStatus::Connected).ok();
     writeln!(log, "resolved peer id matches: {}", v.lock().unwrap().peer_id == host_id).ok();
@@ -193,6 +195,45 @@ fn selftest(log_path: &str) {
         None => "unknown".into(),
     };
     writeln!(log, "presence of host: {presence} after {t:?}").ok();
+
+    // Accept/deny prompt: with ask_on_connect on, a correct password still needs the host to
+    // allow it; denying yields the DENIED error on the controller.
+    host.shared.lock().unwrap().cfg.ask_on_connect = true;
+    let d = ctl.connect(shortid::format(&short), password.clone());
+    wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
+    let got_request = !host.shared.lock().unwrap().requests.is_empty();
+    if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
+        req.answer(false);
+    }
+    wait(&|| matches!(d.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
+    let denied = matches!(&d.lock().unwrap().status, net::ViewStatus::Failed(m) if m == proto::DENIED);
+    writeln!(log, "ask-on-connect: prompt shown={got_request} deny produced DENIED={denied}").ok();
+    host.shared.lock().unwrap().cfg.ask_on_connect = false;
+
+    // Lockout: 5 wrong passwords lock the peer, so the 6th attempt is refused as "locked".
+    let mut saw_locked = false;
+    for i in 0..6 {
+        let bad = ctl.connect(shortid::format(&short), format!("nope-{i}"));
+        wait(&|| matches!(bad.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
+        if let net::ViewStatus::Failed(msg) = &bad.lock().unwrap().status {
+            if msg == proto::LOCKED {
+                saw_locked = true;
+            }
+        }
+    }
+    writeln!(log, "lockout after repeated wrong passwords triggered: {saw_locked}").ok();
+
+    // Access log exists and records events.
+    let log_file = config::config_dir().join("access.log");
+    let entries = std::fs::read_to_string(&log_file).unwrap_or_default();
+    writeln!(
+        log,
+        "access log has connected={} wrong-password={} lines",
+        entries.matches("\tconnected\t").count(),
+        entries.matches("\twrong-password\t").count()
+    )
+    .ok();
+
     std::fs::write(log_path, log).ok();
     std::process::exit(0);
 }

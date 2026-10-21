@@ -39,9 +39,20 @@ pub struct Config {
     pub short_id_key: String,
     #[serde(default)]
     pub contacts: Vec<Contact>,
+    /// Ask the person at this machine to allow each incoming session (in addition to the password).
+    #[serde(default)]
+    pub ask_on_connect: bool,
+    /// Start RemoteDesk automatically when Windows starts.
+    #[serde(default)]
+    pub start_with_windows: bool,
     /// Only used by the self-test, which runs two identities in one process.
     #[serde(skip)]
     key_override: Option<[u8; 32]>,
+}
+
+/// The %APPDATA%\RemoteDesk folder, where config, logs and downloads metadata live.
+pub fn config_dir() -> PathBuf {
+    dir()
 }
 
 fn dir() -> PathBuf {
@@ -91,6 +102,8 @@ impl Config {
             short_id: String::new(),
             short_id_key: String::new(),
             contacts: Vec::new(),
+            ask_on_connect: false,
+            start_with_windows: false,
             key_override: None,
         }
     }
