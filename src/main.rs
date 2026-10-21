@@ -79,7 +79,7 @@ fn selftest(log_path: &str) {
     let host = net::Net::start(host_cfg, ctx.clone()).expect("start host");
     let host_id = host.shared.lock().unwrap().my_id.clone();
     let mut ctl_cfg = config::Config::fresh();
-    ctl_cfg.contacts.push(config::Contact { id: host_id.clone(), short_id: String::new(), name: "host".into(), password: String::new() });
+    ctl_cfg.contacts.push(config::Contact { id: host_id.clone(), name: "host".into(), ..Default::default() });
     let ctl = net::Net::start(ctl_cfg, ctx).expect("start controller");
     writeln!(log, "host id: {host_id}").ok();
     if let (Ok(exe), Ok(sig)) = (std::fs::read("RemoteDesk.exe"), std::fs::read_to_string("RemoteDesk.exe.sig")) {

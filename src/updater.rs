@@ -95,7 +95,9 @@ impl Updater {
         rt.spawn(async move {
             match download_and_install(&exe_url, &sig_url, &version, &state, &ctx).await {
                 Ok(new_exe) => {
-                    let _ = std::process::Command::new(new_exe).spawn();
+                    // ShellExecute (not CreateProcess) so Windows can show the UAC prompt that
+                    // the admin manifest requires.
+                    crate::localinput::shell_open(&new_exe);
                     std::process::exit(0);
                 }
                 Err(e) => *state.lock().unwrap() = UpdateState::Failed(format!("อัปเดตไม่สำเร็จ: {e}")),

@@ -98,9 +98,17 @@ pub fn is_elevated() -> bool {
 
 /// Restarts this program with administrator rights (Windows shows its UAC prompt).
 pub fn relaunch_as_admin() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    std::env::current_exe().map(|exe| shell_execute("runas", &exe)).unwrap_or(false)
+}
+
+/// Starts an exe the way Explorer would, honouring its manifest (UAC prompt if it needs admin).
+pub fn shell_open(exe: &std::path::Path) -> bool {
+    shell_execute("open", exe)
+}
+
+fn shell_execute(verb: &str, exe: &std::path::Path) -> bool {
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    let (verb, file) = (wide("runas"), wide(&exe.to_string_lossy()));
+    let (verb, file) = (wide(verb), wide(&exe.to_string_lossy()));
     let r = unsafe {
         windows_sys::Win32::UI::Shell::ShellExecuteW(
             std::ptr::null_mut(),

@@ -82,6 +82,8 @@ pub struct App {
     session: Option<Session>,
     settings: Option<SettingsDraft>,
     confirm_delete: Option<Contact>,
+    /// Machine being renamed: (id, draft name, focus the field next frame).
+    rename: Option<(String, String, bool)>,
     thumbs: HashMap<String, Option<TextureHandle>>,
     gradients: HashMap<String, TextureHandle>,
     logo: TextureHandle,
@@ -90,6 +92,8 @@ pub struct App {
     capturing_keys: bool,
     #[cfg(debug_assertions)]
     preview: Option<(String, Instant)>,
+    #[cfg(debug_assertions)]
+    font_test: bool,
 }
 
 impl App {
@@ -108,11 +112,14 @@ impl App {
             session: None,
             settings: None,
             confirm_delete: None,
+            rename: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
             logo: logo_texture(&cc.egui_ctx),
             #[cfg(debug_assertions)]
             preview: None,
+            #[cfg(debug_assertions)]
+            font_test: false,
         })
     }
 
@@ -125,7 +132,7 @@ impl App {
         let demo = [("ฝ่ายบัญชี-PC01", "1610852472"), ("Server-Room", "4506757970"), ("พี่เอ็ม Notebook", "9618864830")];
         let ids: Vec<String> = (0..3).map(|_| iroh::SecretKey::generate().public().to_string()).collect();
         for ((name, short), id) in demo.iter().zip(&ids) {
-            cfg.contacts.push(Contact { id: id.clone(), short_id: (*short).into(), name: (*name).into(), password: String::new() });
+            cfg.contacts.push(Contact { id: id.clone(), short_id: (*short).into(), name: (*name).into(), ..Default::default() });
         }
         let net = Net::start(cfg, cc.egui_ctx.clone()).expect("start net");
         {
@@ -147,10 +154,12 @@ impl App {
             session: None,
             settings: None,
             confirm_delete: None,
+            rename: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
             logo: logo_texture(&cc.egui_ctx),
             preview: Some((out, Instant::now())),
+            font_test: mode == "fonts",
         };
         match mode {
             "password" => {
@@ -222,7 +231,7 @@ impl App {
         let existing = sh.cfg.contacts.iter().position(|c| c.id == id);
         let mut c = match existing {
             Some(i) => sh.cfg.contacts.remove(i),
-            None => Contact { id: id.into(), short_id: String::new(), name: String::new(), password: String::new() },
+            None => Contact { id: id.into(), ..Default::default() },
         };
         c.name = name.into();
         if !short.is_empty() {
@@ -296,12 +305,53 @@ impl App {
         self.password_dialog(&ctx);
         self.settings_dialog(&ctx);
         self.delete_dialog(&ctx);
+        self.rename_dialog(&ctx);
+    }
+
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some((id, draft, focus)) = &mut self.rename else { return };
+        let mut save = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("rename")).frame(dialog_frame()).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(RichText::new("แก้ชื่อเครื่อง").font(bold(18.0)));
+            ui.label(RichText::new("ตั้งชื่อให้จำง่าย เช่น ชื่อเจ้าของหรือแผนก (เห็นเฉพาะเครื่องนี้)").color(MUTED).size(13.0));
+            ui.add_space(10.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(draft)
+                    .hint_text("เว้นว่างเพื่อใช้ชื่อคอมพิวเตอร์")
+                    .margin(vec2(10.0, 8.0))
+                    .desired_width(f32::INFINITY),
+            );
+            if std::mem::take(focus) {
+                r.request_focus();
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                save = true;
+            }
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                save |= accent_button(ui, "บันทึก").clicked();
+                close = ui.add(egui::Button::new("ยกเลิก").min_size(vec2(0.0, 34.0))).clicked();
+            });
+        });
+        if save {
+            let mut sh = self.net.shared.lock().unwrap();
+            if let Some(c) = sh.cfg.contacts.iter_mut().find(|c| &c.id == id) {
+                c.alias = draft.trim().to_string();
+            }
+            sh.cfg.save();
+        }
+        if save || close || modal.should_close() {
+            self.rename = None;
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.add(egui::Image::from_texture((self.logo.id(), vec2(30.0, 30.0))));
             ui.label(RichText::new("RemoteDesk").font(bold(17.0)).color(TEXT));
+            ui.label(RichText::new(format!("v{}", updater::VERSION)).color(MUTED).size(12.0));
             ui.add_space(24.0);
 
             let edit = egui::TextEdit::singleline(&mut self.address)
@@ -481,12 +531,14 @@ impl App {
                     match action {
                         CardAction::Connect => connect = Some(c.clone()),
                         CardAction::Delete => self.confirm_delete = Some(c.clone()),
+                        CardAction::Rename => self.rename = Some((c.id.clone(), c.display_name(None), true)),
                     }
                 }
             }
         });
         if let Some(c) = connect {
-            let label = if c.name.is_empty() { shortid::format(&c.short_id) } else { c.name.clone() };
+            let name = c.display_name(None);
+            let label = if name.is_empty() { shortid::format(&c.short_id) } else { name };
             self.request_connect(c.id.clone(), label, Some(c.password.clone()));
         }
     }
@@ -498,9 +550,9 @@ impl App {
         let radius = CornerRadius::same(12);
 
         let (status_color, status_text, name) = match &presence {
-            Some(Presence::Online { name }) => (GREEN, "ออนไลน์", name.clone()),
-            Some(Presence::Offline) => (Color32::from_rgb(120, 120, 128), "ออฟไลน์", c.name.clone()),
-            None => (AMBER, "กำลังตรวจสอบ", c.name.clone()),
+            Some(Presence::Online { name }) => (GREEN, "ออนไลน์", c.display_name(Some(name))),
+            Some(Presence::Offline) => (Color32::from_rgb(120, 120, 128), "ออฟไลน์", c.display_name(None)),
+            None => (AMBER, "กำลังตรวจสอบ", c.display_name(None)),
         };
         let offline = matches!(presence, Some(Presence::Offline));
 
@@ -546,6 +598,22 @@ impl App {
             let s = Stroke::new(1.8, Color32::WHITE);
             painter.line_segment([c0 + vec2(-d, -d), c0 + vec2(d, d)], s);
             painter.line_segment([c0 + vec2(-d, d), c0 + vec2(d, -d)], s);
+        }
+
+        // Rename button, left of delete.
+        let ren_rect = del_rect.translate(vec2(-30.0, 0.0));
+        let ren = ui.interact(ren_rect, resp.id.with("ren"), Sense::click()).on_hover_text("แก้ชื่อเครื่อง");
+        if resp.hovered() || del.hovered() || ren.hovered() {
+            let fill = if ren.hovered() { ACCENT } else { Color32::from_black_alpha(150) };
+            painter.circle_filled(ren_rect.center(), 12.0, fill);
+            // Pencil.
+            let c0 = ren_rect.center();
+            let s = Stroke::new(1.8, Color32::WHITE);
+            painter.line_segment([c0 + vec2(-4.5, 4.5), c0 + vec2(4.0, -4.0)], s);
+            painter.line_segment([c0 + vec2(-5.5, 5.5), c0 + vec2(-3.0, 5.5)], s);
+        }
+        if ren.clicked() {
+            return Some(CardAction::Rename);
         }
 
         let border = if resp.hovered() { Stroke::new(2.0, ACCENT_LIGHT) } else { Stroke::new(1.0, BORDER) };
@@ -998,6 +1066,7 @@ impl App {
 enum CardAction {
     Connect,
     Delete,
+    Rename,
 }
 
 impl eframe::App for App {
@@ -1021,6 +1090,19 @@ impl eframe::App for App {
                     std::process::exit(0);
                 })));
             }
+        }
+        #[cfg(debug_assertions)]
+        if self.font_test {
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG).inner_margin(20)).show(ui, |ui| {
+                for size in [12.5, 14.5, 18.0, 46.0] {
+                    for font in [FontId::proportional(size), bold(size)] {
+                        let r = ui.label(RichText::new("คัดลอก ID ของเครื่องนี้ Hello 123 ทดสอบ").font(font));
+                        ui.painter().hline(r.rect.x_range(), r.rect.center().y, Stroke::new(1.0, Color32::from_rgb(255, 0, 0)));
+                    }
+                }
+                let _ = ui.button("คัดลอก ID");
+            });
+            return;
         }
         if self.session.is_some() {
             self.session_ui(ui);
@@ -1296,6 +1378,14 @@ fn save_thumbnail(id: &str, fb: &[u8], [w, h]: [usize; 2]) {
     }
 }
 
+fn latin_tweak() -> (f32, f32) {
+    #[cfg(debug_assertions)]
+    if let (Ok(s), Ok(y)) = (std::env::var("RD_FONT_SCALE"), std::env::var("RD_FONT_Y")) {
+        return (s.parse().unwrap_or(1.0), y.parse().unwrap_or(0.0));
+    }
+    (0.92, -0.12)
+}
+
 fn setup_style(ctx: &egui::Context) {
     // Thai text uses Noto Sans Thai (embedded, so every machine looks the same). It only covers
     // Thai, so Latin letters and digits come from Segoe UI, then egui's bundled fonts.
@@ -1307,6 +1397,17 @@ fn setup_style(ctx: &egui::Context) {
     add("noto-thai-sb", include_bytes!("../assets/fonts/NotoSansThai-SemiBold.ttf").to_vec());
     let segoe = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf").ok().map(|d| add("segoe", d)).is_some();
     let segoe_sb = std::fs::read(r"C:\Windows\Fonts\seguisb.ttf").ok().map(|d| add("segoe-sb", d)).is_some();
+    // Segoe UI sits higher and reads larger than Noto Sans Thai at the same size; nudge it so
+    // mixed Thai/English text shares one baseline and visual size.
+    let (scale, y_off) = latin_tweak();
+    for name in ["segoe", "segoe-sb"] {
+        if let Some(data) = fonts.font_data.get_mut(name) {
+            let mut d = (**data).clone();
+            d.tweak.scale = scale;
+            d.tweak.y_offset_factor = y_off;
+            *data = Arc::new(d);
+        }
+    }
     let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
 
     let mut regular: Vec<String> = vec!["noto-thai".into()];

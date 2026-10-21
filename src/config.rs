@@ -4,7 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Contact {
     pub id: String,
     #[serde(default)]
@@ -12,6 +12,20 @@ pub struct Contact {
     pub name: String,
     #[serde(default)]
     pub password: String,
+    /// Name the user gave this machine; shown instead of its computer name when set.
+    #[serde(default)]
+    pub alias: String,
+}
+
+impl Contact {
+    /// What to call this machine in the UI.
+    pub fn display_name(&self, live_name: Option<&str>) -> String {
+        if !self.alias.trim().is_empty() {
+            self.alias.trim().to_string()
+        } else {
+            live_name.filter(|n| !n.is_empty()).unwrap_or(&self.name).to_string()
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
