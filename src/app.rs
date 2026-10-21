@@ -101,6 +101,8 @@ pub struct App {
     gradients: HashMap<String, TextureHandle>,
     logo: TextureHandle,
     updater: Updater,
+    /// True once the tray icon is running, so closing the window hides to tray instead of exiting.
+    close_to_tray: bool,
     /// Whether the local keyboard is currently being sent to the remote.
     capturing_keys: bool,
     #[cfg(debug_assertions)]
@@ -115,8 +117,10 @@ impl App {
         let net = Net::start(crate::config::Config::load(), cc.egui_ctx.clone())?;
         // Keep the Windows Run entry in sync with the saved setting.
         crate::autostart::set_enabled(net.shared.lock().unwrap().cfg.start_with_windows);
+        crate::tray::start(cc.egui_ctx.clone());
         let updater = Updater::start(net.runtime(), cc.egui_ctx.clone());
         Ok(App {
+            close_to_tray: true,
             capturing_keys: false,
             updater,
             net,
@@ -159,6 +163,7 @@ impl App {
         *updater.state.lock().unwrap() =
             UpdateState::Available { version: "1.1.0".into(), notes: "ตัวอย่าง".into() };
         let mut app = App {
+            close_to_tray: false,
             capturing_keys: false,
             updater,
             net,
@@ -1137,6 +1142,11 @@ impl eframe::App for App {
                 let _ = ui.button("คัดลอก ID");
             });
             return;
+        }
+        // Closing the window hides to the tray; quit from the tray menu to exit.
+        if self.close_to_tray && ui.ctx().input(|i| i.viewport().close_requested()) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         if self.session.is_some() {
             self.session_ui(ui);

@@ -9,6 +9,7 @@ mod net;
 mod proto;
 mod shortid;
 mod transfer;
+mod tray;
 mod autostart;
 mod security;
 mod updater;
