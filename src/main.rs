@@ -12,6 +12,7 @@ mod transfer;
 mod autostart;
 mod security;
 mod updater;
+mod winclip;
 
 use eframe::egui;
 
@@ -22,6 +23,20 @@ pub fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // Dev check: `remotedesk --clip-test` round-trips a file list through the clipboard.
+    #[cfg(debug_assertions)]
+    if std::env::args().nth(1).as_deref() == Some("--clip-test") {
+        let f1 = std::env::temp_dir().join("rd-clip-a.txt");
+        let f2 = std::env::temp_dir().join("rd-clip-b.txt");
+        std::fs::write(&f1, "a").ok();
+        std::fs::write(&f2, "b").ok();
+        let set = winclip::set_files(&[f1.clone(), f2.clone()]);
+        let got = winclip::get_files();
+        let ok = got.as_ref().map(|v| v.len() == 2 && v[0] == f1 && v[1] == f2).unwrap_or(false);
+        println!("set={set} get={got:?} roundtrip_ok={ok}");
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // Release tooling: `remotedesk --sign <exe> <key file>` writes <exe>.sig.
     if let [_, flag, exe, key] = std::env::args().collect::<Vec<_>>().as_slice() {
         if flag == "--sign" {

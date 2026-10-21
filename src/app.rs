@@ -286,11 +286,6 @@ impl App {
                                 if danger_button(ui, "ตัดการเชื่อมต่อ").clicked() {
                                     conn.close(0u32.into(), b"kicked");
                                 }
-                                if ui.add(egui::Button::new("ส่งไฟล์").min_size(vec2(0.0, 34.0))).clicked() {
-                                    if let Some(files) = rfd::FileDialog::new().pick_files() {
-                                        self.net.send_files(conn.clone(), name.clone(), files);
-                                    }
-                                }
                             });
                         });
                     }
@@ -979,7 +974,6 @@ impl App {
         }
 
         let mut disconnect = false;
-        let mut paste = false;
         let mut send_files: Vec<std::path::PathBuf> = Vec::new();
         egui::Panel::top("toolbar")
             .exact_size(46.0)
@@ -1015,27 +1009,9 @@ impl App {
                             s.fullscreen = !s.fullscreen;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(s.fullscreen));
                         }
-                        if ui
-                            .add(egui::Button::new("พิมพ์คลิปบอร์ด").min_size(vec2(0.0, 32.0)))
-                            .on_hover_text("พิมพ์ข้อความในคลิปบอร์ดทีละตัว ใช้กับช่องที่วางไม่ได้ เช่น หน้าต่างรหัสผ่าน")
-                            .clicked()
-                        {
-                            paste = true;
-                        }
-                        if ui
-                            .add(egui::Button::new("ส่งไฟล์").min_size(vec2(0.0, 32.0)))
-                            .on_hover_text("หรือลากไฟล์มาวางบนหน้าจอ")
-                            .clicked()
-                        {
-                            send_files = rfd::FileDialog::new().pick_files().unwrap_or_default();
-                        }
                     });
                 });
             });
-        if paste {
-            s.type_paste = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-        }
         send_files.extend(dropped_paths(&ctx));
         if !send_files.is_empty() {
             let conn = s.viewer.lock().unwrap().connection();

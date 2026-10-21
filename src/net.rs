@@ -289,9 +289,12 @@ async fn run_viewer(
             let Ok(mut events) = conn.accept_uni().await else { return };
             let files = {
                 let (conn, ctx) = (conn.clone(), ctx.clone());
+                let clipboard = clipboard.clone();
                 async move {
                     while let Ok(recv) = conn.accept_uni().await {
-                        tokio::spawn(transfer::receive_file(recv, peer_name.clone(), transfers.clone(), ctx.clone()));
+                        let (peer_name, transfers, clipboard, ctx) =
+                            (peer_name.clone(), transfers.clone(), clipboard.clone(), ctx.clone());
+                        tokio::spawn(transfer::receive_uni(recv, peer_name, transfers, clipboard, ctx));
                     }
                 }
             };
@@ -311,11 +314,18 @@ async fn run_viewer(
     }
     let (clip_id, mut clip_rx) = clipboard.subscribe();
     {
-        let tx = tx.clone();
+        let (tx, conn) = (tx.clone(), conn.clone());
         tokio::spawn(async move {
-            while let Some(text) = clip_rx.recv().await {
-                if tx.send(Input::Clipboard(text)).is_err() {
-                    break;
+            while let Some(item) = clip_rx.recv().await {
+                match item {
+                    transfer::ClipItem::Text(text) => {
+                        if tx.send(Input::Clipboard(text)).is_err() {
+                            break;
+                        }
+                    }
+                    transfer::ClipItem::Files(paths) => {
+                        let _ = transfer::send_clip_bundle(conn.clone(), paths).await;
+                    }
                 }
             }
         });
@@ -589,9 +599,14 @@ async fn serve_control(
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
-                text = clip_rx.recv() => {
-                    let Some(text) = text else { break };
-                    write_json(&mut events, &HostMsg::Clipboard(text)).await?;
+                item = clip_rx.recv() => {
+                    let Some(item) = item else { break };
+                    match item {
+                        transfer::ClipItem::Text(text) => write_json(&mut events, &HostMsg::Clipboard(text)).await?,
+                        transfer::ClipItem::Files(paths) => {
+                            let _ = transfer::send_clip_bundle(conn.clone(), paths).await;
+                        }
+                    }
                 }
                 _ = tick.tick() => {
                     let now = crate::localinput::local_active();
@@ -606,7 +621,9 @@ async fn serve_control(
     };
     let files = async {
         while let Ok(recv) = conn.accept_uni().await {
-            tokio::spawn(transfer::receive_file(recv, peer_name.clone(), transfers.clone(), ctx.clone()));
+            let (peer_name, transfers, clipboard, ctx) =
+                (peer_name.clone(), transfers.clone(), clipboard.clone(), ctx.clone());
+            tokio::spawn(transfer::receive_uni(recv, peer_name, transfers, clipboard, ctx));
         }
     };
     let video = async {
