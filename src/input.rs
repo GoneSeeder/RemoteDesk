@@ -4,9 +4,8 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
@@ -87,6 +86,31 @@ fn send_key(vk: u16, scan: u16, extended: bool, down: bool) -> bool {
     unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
 }
 
+/// Presses or releases a key by virtual-key code alone.
+fn send_vk(vk: u16, down: bool) -> bool {
+    send_key(vk, 0, is_extended(vk), down)
+}
+
+/// Extended keys (arrows, Ins/Del/Home/End, right-side modifiers, numpad /, Win) must carry the
+/// extended flag for Windows to recognise them.
+fn is_extended(vk: u16) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0xA3 | 0xA5 | 0x6F | 0x90)
+}
+
+/// Types text as Unicode characters, independent of the remote's keyboard layout.
+fn send_text(text: &str) {
+    for unit in text.encode_utf16() {
+        for up in [false, true] {
+            let flags = KEYEVENTF_UNICODE | if up { KEYEVENTF_KEYUP } else { 0 };
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: 0, wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+            };
+            unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        }
+    }
+}
+
 fn button_flags(button: u8, down: bool) -> MOUSE_EVENT_FLAGS {
     match (button, down) {
         (1, true) => MOUSEEVENTF_RIGHTDOWN,
@@ -99,13 +123,6 @@ fn button_flags(button: u8, down: bool) -> MOUSE_EVENT_FLAGS {
 }
 
 fn run(rx: Receiver<Cmd>) {
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => Some(e),
-        Err(e) => {
-            log(&format!("keyboard init failed: {e:?}"));
-            None
-        }
-    };
     log("input thread started");
     let mut mods = [false; 3]; // ctrl, shift, alt as currently held by us
     let mut held_keys: Vec<u16> = Vec::new();
@@ -113,12 +130,9 @@ fn run(rx: Receiver<Cmd>) {
     let mut held_raw: Vec<(u16, u16, bool)> = Vec::new();
     let (mut received, mut paused, mut failed) = (0u64, 0u64, 0u64);
 
-    let set_mod = |enigo: &mut Option<Enigo>, held: &mut bool, vk: u16, want: bool| {
+    let set_mod = |held: &mut bool, vk: u16, want: bool| {
         if *held != want {
-            let dir = if want { Direction::Press } else { Direction::Release };
-            if let Some(e) = enigo {
-                let _ = e.key(Key::Other(vk as u32), dir);
-            }
+            send_vk(vk, want);
             *held = want;
         }
     };
@@ -189,40 +203,30 @@ fn run(rx: Receiver<Cmd>) {
                 }
             }
             Cmd::Input(_, _, Input::Key { vk, down, ctrl, shift, alt }) => {
-                set_mod(&mut enigo, &mut mods[0], VK_CONTROL, ctrl);
-                set_mod(&mut enigo, &mut mods[1], VK_SHIFT, shift);
-                set_mod(&mut enigo, &mut mods[2], VK_MENU, alt);
-                if let Some(e) = &mut enigo {
-                    let _ = e.key(Key::Other(vk as u32), if down { Direction::Press } else { Direction::Release });
-                }
+                set_mod(&mut mods[0], VK_CONTROL, ctrl);
+                set_mod(&mut mods[1], VK_SHIFT, shift);
+                set_mod(&mut mods[2], VK_MENU, alt);
+                send_vk(vk, down);
                 held_keys.retain(|&k| k != vk);
                 if down {
                     held_keys.push(vk);
                 }
             }
             Cmd::Input(_, _, Input::Text(text)) => {
-                set_mod(&mut enigo, &mut mods[0], VK_CONTROL, false);
-                set_mod(&mut enigo, &mut mods[1], VK_SHIFT, false);
-                set_mod(&mut enigo, &mut mods[2], VK_MENU, false);
-                if let Some(e) = &mut enigo {
-                    let _ = e.text(&text);
-                }
+                set_mod(&mut mods[0], VK_CONTROL, false);
+                set_mod(&mut mods[1], VK_SHIFT, false);
+                set_mod(&mut mods[2], VK_MENU, false);
+                send_text(&text);
             }
             Cmd::Input(_, _, Input::Clipboard(_)) | Cmd::Input(_, _, Input::Chat(_)) => {}
             Cmd::Input(_, _, Input::KeyVk { vk, down }) => {
-                // Extended keys (arrows, Ins/Del/Home/End, right-side modifiers, numpad /, Win)
-                // must carry the extended flag for Windows to recognise them.
-                let extended = matches!(
-                    vk,
-                    0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0xA3 | 0xA5 | 0x6F | 0x90
-                );
-                if !send_key(vk, 0, extended, down) {
+                if !send_vk(vk, down) {
                     failed += 1;
                     log(&format!("SendInput(keyvk) failed, error {}", std::io::Error::last_os_error()));
                 }
                 held_raw.retain(|&(v, _, _)| v != vk);
                 if down {
-                    held_raw.push((vk, 0, extended));
+                    held_raw.push((vk, 0, is_extended(vk)));
                 }
             }
             Cmd::Input(_, _, Input::RawKey { vk, scan, extended, down }) => {
@@ -237,9 +241,7 @@ fn run(rx: Receiver<Cmd>) {
             }
             Cmd::Reset => {
                 for vk in held_keys.drain(..) {
-                    if let Some(e) = &mut enigo {
-                        let _ = e.key(Key::Other(vk as u32), Direction::Release);
-                    }
+                    send_vk(vk, false);
                 }
                 for (vk, scan, extended) in held_raw.drain(..) {
                     send_key(vk, scan, extended, false);
@@ -247,9 +249,9 @@ fn run(rx: Receiver<Cmd>) {
                 for b in held_buttons.drain(..) {
                     send_mouse(button_flags(b, false), 0, 0, 0);
                 }
-                set_mod(&mut enigo, &mut mods[0], VK_CONTROL, false);
-                set_mod(&mut enigo, &mut mods[1], VK_SHIFT, false);
-                set_mod(&mut enigo, &mut mods[2], VK_MENU, false);
+                set_mod(&mut mods[0], VK_CONTROL, false);
+                set_mod(&mut mods[1], VK_SHIFT, false);
+                set_mod(&mut mods[2], VK_MENU, false);
             }
         }
     }
