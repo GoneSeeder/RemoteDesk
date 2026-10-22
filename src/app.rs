@@ -1038,7 +1038,7 @@ impl App {
                     let (c, t) = if direct { (GREEN, "เชื่อมต่อตรง") } else { (AMBER, "ผ่าน Relay") };
                     pill(ui, c, t);
                     if wide && crate::localinput::key_capture_active() {
-                        ui.label(RichText::new("คีย์ลัดทั้งหมดส่งไปเครื่องปลายทาง").color(MUTED).size(12.5))
+                        ui.label(RichText::new("ปุ่ม Win และ Alt+Tab ส่งไปเครื่องปลายทาง").color(MUTED).size(12.5))
                             .on_hover_text("รวมถึงปุ่ม Win และ Alt+Tab คลิกนอกหน้าต่างเพื่อใช้คีย์บอร์ดกับเครื่องตัวเอง");
                     }
                     if remote_busy {
@@ -1323,8 +1323,9 @@ impl App {
             let v = s.viewer.lock().unwrap();
             (v.status == ViewStatus::Connected).then(|| v.input.clone()).flatten()
         });
-        // Keys come from this window's own input events (egui), which is reliable for Ctrl shortcuts.
-        let want = false && focused && tx.is_some() && self.pending.is_none() && self.settings.is_none();
+        // Ordinary keys come from this window's egui events; the hook only takes the system keys
+        // (Win, Alt+Tab, ...) that Windows would otherwise handle before the window sees them.
+        let want = focused && tx.is_some() && self.pending.is_none() && self.settings.is_none();
         if want != self.capturing_keys {
             self.capturing_keys = want;
             crate::localinput::set_key_capture(tx.filter(|_| want).map(|tx| {

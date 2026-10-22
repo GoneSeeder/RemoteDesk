@@ -10,8 +10,10 @@ use std::sync::mpsc::{Sender, channel};
 use crate::proto::Input;
 
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_RWIN, VK_TAB};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, LLMHF_INJECTED, MSG,
+    CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP,
+    LLMHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, SetWindowsHookExW, WH_KEYBOARD_LL, WH_MOUSE_LL,
 };
 
@@ -20,9 +22,12 @@ pub const LOCAL_PRIORITY_MS: u64 = 1000;
 
 static LAST_LOCAL: AtomicU64 = AtomicU64::new(0);
 
-/// While a remote session window is focused, every physical key is forwarded to the remote and
-/// swallowed locally (like AnyDesk), so shortcuts such as Win+E act on the remote machine.
+/// While a remote session window is focused, the keys Windows would otherwise grab for itself
+/// (Win, Win+anything, Alt+Tab, Alt+Esc, Ctrl+Esc) are forwarded to the remote and swallowed
+/// locally. Every other key reaches the window normally and is sent from its egui events.
 static CAPTURE: AtomicBool = AtomicBool::new(false);
+/// A Win key is held down (touched only by the hook thread).
+static WIN_HELD: AtomicBool = AtomicBool::new(false);
 
 /// One captured key: (vk, scan, extended, down). Sent from the low-level hook — which must stay
 /// fast or Windows silently drops it — to a forwarder thread that does the real work.
@@ -97,14 +102,22 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize)
     if code >= 0 {
         let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if info.flags & LLKHF_INJECTED == 0 {
-            if CAPTURE.load(Ordering::Relaxed) {
+            let vk = info.vkCode as u16;
+            let down = info.flags & LLKHF_UP == 0;
+            let is_win = vk == VK_LWIN || vk == VK_RWIN;
+            if is_win {
+                WIN_HELD.store(down, Ordering::Relaxed);
+            }
+            let system_key = is_win
+                || WIN_HELD.load(Ordering::Relaxed)
+                || ((vk == VK_TAB || vk == VK_ESCAPE) && info.flags & LLKHF_ALTDOWN != 0)
+                || (vk == VK_ESCAPE && unsafe { GetAsyncKeyState(VK_CONTROL as i32) } < 0);
+            if system_key && CAPTURE.load(Ordering::Relaxed) {
                 // Keep this path minimal: just forward the key and swallow it. Doing real work
                 // (locks, channel to the network) here can exceed Windows' hook timeout, which
                 // silently drops the hook so the shortcut leaks to the local machine instead.
-                let vk = info.vkCode as u16;
                 let scan = info.scanCode as u16;
                 let extended = info.flags & LLKHF_EXTENDED != 0;
-                let down = info.flags & LLKHF_UP == 0;
                 if let Some(tx) = KEY_TX.get() {
                     let _ = tx.send((vk, scan, extended, down));
                 }
