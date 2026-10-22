@@ -60,14 +60,21 @@ pub struct AccessRequest {
     pub id: u64,
     pub name: String,
     pub peer: String,
-    reply: Option<tokio::sync::oneshot::Sender<bool>>,
+    reply: Option<tokio::sync::oneshot::Sender<Option<Permissions>>>,
 }
 
 impl AccessRequest {
-    pub fn answer(&mut self, allow: bool) {
+    /// `Some(perms)` allows the session with those permissions; `None` denies it.
+    pub fn answer(&mut self, perms: Option<Permissions>) {
         if let Some(tx) = self.reply.take() {
-            let _ = tx.send(allow);
+            let _ = tx.send(perms);
         }
+    }
+
+    /// A dummy request for the UI preview only (its reply goes nowhere).
+    #[cfg(debug_assertions)]
+    pub fn preview(name: &str, peer: &str) -> AccessRequest {
+        AccessRequest { id: 1, name: name.into(), peer: peer.into(), reply: None }
     }
 }
 
@@ -96,6 +103,8 @@ pub struct Viewer {
     pub direct: bool,
     /// The remote user is using their own mouse/keyboard right now.
     pub remote_busy: bool,
+    /// What this session is allowed to do, as granted by the controlled machine.
+    pub perms: Permissions,
     pub patches: Vec<Patch>,
     pub bytes: u64,
     pub frames: u64,
@@ -208,6 +217,7 @@ impl Net {
             status: ViewStatus::Connecting,
             direct: false,
             remote_busy: false,
+            perms: Permissions::all(),
             patches: Vec::new(),
             bytes: 0,
             frames: 0,
@@ -335,6 +345,7 @@ async fn run_viewer(
         v.status = ViewStatus::Connected;
         v.peer_name = welcome.name;
         v.peer_short = welcome.short;
+        v.perms = welcome.perms;
         v.input = Some(tx);
         v.conn = Some(conn.clone());
     }
@@ -531,7 +542,7 @@ async fn serve_control(
     // Locked out from too many wrong passwords?
     if let Some(remaining) = security::lockout_remaining(&peer) {
         security::log("locked", &peer, &hello.name, &format!("{}s remaining", remaining.as_secs()));
-        write_json(&mut send, &Welcome { ok: false, msg: LOCKED.into(), name: my_name, short }).await?;
+        write_json(&mut send, &Welcome { ok: false, msg: LOCKED.into(), name: my_name, short, perms: Permissions::all() }).await?;
         send.finish()?;
         let _ = timeout(Duration::from_secs(3), conn.closed()).await;
         return Ok(());
@@ -545,14 +556,15 @@ async fn serve_control(
         // Slow down password guessing.
         sleep(Duration::from_secs(2)).await;
         let msg = if lock.is_some() { LOCKED } else { WRONG_PASSWORD };
-        write_json(&mut send, &Welcome { ok: false, msg: msg.into(), name: my_name, short }).await?;
+        write_json(&mut send, &Welcome { ok: false, msg: msg.into(), name: my_name, short, perms: Permissions::all() }).await?;
         send.finish()?;
         let _ = timeout(Duration::from_secs(3), conn.closed()).await;
         return Ok(());
     }
     security::record_success(&peer);
 
-    // Optional: ask the person at this machine to allow the session.
+    // Optional: ask the person at this machine to allow the session and choose permissions.
+    let mut perms = Permissions::all();
     if ask {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req_id = session;
@@ -563,20 +575,23 @@ async fn serve_control(
             reply: Some(tx),
         });
         ctx.request_repaint();
-        let allowed = timeout(Duration::from_secs(30), rx).await.ok().and_then(|r| r.ok()).unwrap_or(false);
+        let answer = timeout(Duration::from_secs(30), rx).await.ok().and_then(|r| r.ok()).flatten();
         shared.lock().unwrap().requests.retain(|r| r.id != req_id);
         ctx.request_repaint();
-        if !allowed {
-            security::log("denied", &peer, &hello.name, "");
-            write_json(&mut send, &Welcome { ok: false, msg: DENIED.into(), name: my_name, short }).await?;
-            send.finish()?;
-            let _ = timeout(Duration::from_secs(3), conn.closed()).await;
-            return Ok(());
+        match answer {
+            Some(p) => perms = p,
+            None => {
+                security::log("denied", &peer, &hello.name, "");
+                write_json(&mut send, &Welcome { ok: false, msg: DENIED.into(), name: my_name, short, perms: Permissions::all() }).await?;
+                send.finish()?;
+                let _ = timeout(Duration::from_secs(3), conn.closed()).await;
+                return Ok(());
+            }
         }
     }
 
     security::log("connected", &peer, &hello.name, "");
-    write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short }).await?;
+    write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short, perms }).await?;
 
     shared.lock().unwrap().incoming.push(Incoming {
         session,
@@ -614,11 +629,15 @@ async fn serve_control(
             tokio::select! {
                 item = clip_rx.recv() => {
                     let Some(item) = item else { break };
+                    if !perms.clipboard {
+                        continue;
+                    }
                     match item {
                         transfer::ClipItem::Text(text) => write_json(&mut events, &HostMsg::Clipboard(text)).await?,
-                        transfer::ClipItem::Files(paths) => {
+                        transfer::ClipItem::Files(paths) if perms.files => {
                             let _ = transfer::send_clip_bundle(conn.clone(), paths).await;
                         }
+                        transfer::ClipItem::Files(_) => {}
                     }
                 }
                 _ = tick.tick() => {
@@ -634,6 +653,9 @@ async fn serve_control(
     };
     let files = async {
         while let Ok(recv) = conn.accept_uni().await {
+            if !perms.files {
+                continue; // file transfer not permitted; drop the stream
+            }
             let (peer_name, transfers, clipboard, ctx) =
                 (peer_name.clone(), transfers.clone(), clipboard.clone(), ctx.clone());
             tokio::spawn(transfer::receive_uni(recv, peer_name, transfers, clipboard, ctx));
@@ -649,7 +671,13 @@ async fn serve_control(
         loop {
             let event: Input = read_json(&mut recv).await?;
             if let Input::Clipboard(text) = event {
-                clipboard.set(text);
+                if perms.clipboard {
+                    clipboard.set(text);
+                }
+                continue;
+            }
+            // When control is not granted the session is view-only: ignore mouse/keyboard.
+            if !perms.control {
                 continue;
             }
             let g: Geometry = *geometry.lock().unwrap();

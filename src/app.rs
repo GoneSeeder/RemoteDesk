@@ -97,6 +97,8 @@ pub struct App {
     confirm_delete: Option<Contact>,
     /// Machine being renamed: (id, draft name, focus the field next frame).
     rename: Option<(String, String, bool)>,
+    /// Checkbox state for the incoming-access dialog: (request id, permissions).
+    access_draft: Option<(u64, crate::proto::Permissions)>,
     thumbs: HashMap<String, Option<TextureHandle>>,
     gradients: HashMap<String, TextureHandle>,
     logo: TextureHandle,
@@ -133,6 +135,7 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
+            access_draft: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
             logo: logo_texture(&cc.egui_ctx),
@@ -176,6 +179,7 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
+            access_draft: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
             logo: logo_texture(&cc.egui_ctx),
@@ -194,6 +198,12 @@ impl App {
                 })
             }
             "settings" => app.settings = Some(SettingsDraft { name: "DESKTOP-Q4221RT".into(), password: "k7m2p9xa".into(), ..Default::default() }),
+            "access" => {
+                app.net.shared.lock().unwrap().requests.push(crate::net::AccessRequest::preview(
+                    "สมชาย โน้ตบุ๊ก",
+                    "8be7b4433270a0d4c24bbd0d71146f2a0",
+                ));
+            }
             _ => {}
         }
         app
@@ -896,7 +906,7 @@ impl App {
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(s) = &mut self.session else { return };
-        let remote_busy = s.viewer.lock().unwrap().remote_busy;
+        let (remote_busy, view_only) = { let v = s.viewer.lock().unwrap(); (v.remote_busy, !v.perms.control) };
         let (status, peer_id, peer_short, name, direct, frames, bytes, patches) = {
             let mut v = s.viewer.lock().unwrap();
             (
@@ -1002,6 +1012,9 @@ impl App {
                     }
                     if remote_busy {
                         pill(ui, AMBER, "ปลายทางกำลังใช้เมาส์/คีย์บอร์ดเอง");
+                    if view_only {
+                        pill(ui, AMBER, "โหมดดูอย่างเดียว");
+                    }
                     }
                     if wide {
                         ui.label(RichText::new(format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)).color(MUTED).size(13.0));
@@ -1173,30 +1186,45 @@ impl App {
             sh.requests.first().map(|r| (r.id, r.name.clone(), r.peer.clone()))
         };
         let Some((id, name, peer)) = pending else { return };
-        let mut answer: Option<bool> = None;
+        // Reset the checkboxes (all allowed) when a new request appears.
+        if self.access_draft.map(|(i, _)| i) != Some(id) {
+            self.access_draft = Some((id, crate::proto::Permissions::all()));
+        }
+        let perms = &mut self.access_draft.as_mut().unwrap().1;
+        let mut answer: Option<Option<crate::proto::Permissions>> = None;
         egui::Modal::new(egui::Id::unique("access")).frame(dialog_frame()).show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(380.0);
             ui.label(RichText::new("มีคนขอเข้าควบคุมเครื่องนี้").font(bold(18.0)));
-            ui.add_space(6.0);
-            ui.label(RichText::new(&name).font(bold(15.0)));
-            ui.label(RichText::new(format!("ID {}…", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
-            ui.add_space(6.0);
-            ui.label(RichText::new("อนุญาตให้ควบคุมเครื่องนี้หรือไม่? (รหัสผ่านถูกต้องแล้ว)").color(MUTED).size(13.0));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                dot(ui, ACCENT_LIGHT, 10.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&name).font(bold(15.0)));
+                    ui.label(RichText::new(format!("ID {}…  ·  รหัสผ่านถูกต้องแล้ว", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
+                });
+            });
+            ui.add_space(12.0);
+            ui.label(RichText::new("อนุญาตให้ทำสิ่งเหล่านี้").color(MUTED).size(13.0));
+            ui.add_space(4.0);
+            ui.checkbox(&mut perms.control, "ควบคุมเมาส์และคีย์บอร์ด (ถ้าไม่ติ๊ก = ดูจออย่างเดียว)");
+            ui.checkbox(&mut perms.clipboard, "ใช้คลิปบอร์ดร่วมกัน");
+            ui.checkbox(&mut perms.files, "ส่ง/รับไฟล์");
             ui.add_space(14.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if accent_button(ui, "อนุญาต").clicked() {
-                    answer = Some(true);
+                    answer = Some(Some(*perms));
                 }
                 if danger_button(ui, "ปฏิเสธ").clicked() {
-                    answer = Some(false);
+                    answer = Some(None);
                 }
             });
         });
-        if let Some(allow) = answer {
+        if let Some(result) = answer {
             let mut sh = self.net.shared.lock().unwrap();
             if let Some(req) = sh.requests.iter_mut().find(|r| r.id == id) {
-                req.answer(allow);
+                req.answer(result);
             }
+            self.access_draft = None;
         }
     }
 

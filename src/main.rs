@@ -281,11 +281,22 @@ fn selftest(log_path: &str) {
     wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
     let got_request = !host.shared.lock().unwrap().requests.is_empty();
     if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
-        req.answer(false);
+        req.answer(None);
     }
     wait(&|| matches!(d.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
     let denied = matches!(&d.lock().unwrap().status, net::ViewStatus::Failed(m) if m == proto::DENIED);
     writeln!(log, "ask-on-connect: prompt shown={got_request} deny produced DENIED={denied}").ok();
+
+    // Grant view-only (control off): the controller should connect and see perms.control=false.
+    let vo = ctl.connect(shortid::format(&short), password.clone());
+    wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
+    if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
+        req.answer(Some(proto::Permissions { control: false, clipboard: true, files: false }));
+    }
+    wait(&|| vo.lock().unwrap().status == net::ViewStatus::Connected, 30);
+    let p = vo.lock().unwrap().perms;
+    writeln!(log, "view-only grant: connected={} control={} files={}", vo.lock().unwrap().status == net::ViewStatus::Connected, p.control, p.files).ok();
+    vo.lock().unwrap().disconnect();
     host.shared.lock().unwrap().cfg.ask_on_connect = false;
 
     // Lockout: 5 wrong passwords lock the peer, so the 6th attempt is refused as "locked".

@@ -49,6 +49,23 @@ pub struct Welcome {
     pub name: String,
     #[serde(default)]
     pub short: String,
+    /// What the controller is allowed to do (chosen by the controlled user, or all-on).
+    #[serde(default = "Permissions::all")]
+    pub perms: Permissions,
+}
+
+/// What an incoming controller may do on the controlled machine.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Permissions {
+    pub control: bool,
+    pub clipboard: bool,
+    pub files: bool,
+}
+
+impl Permissions {
+    pub fn all() -> Permissions {
+        Permissions { control: true, clipboard: true, files: true }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
