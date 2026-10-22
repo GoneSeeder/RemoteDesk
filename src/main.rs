@@ -164,9 +164,9 @@ fn selftest(log_path: &str) {
 
     let mut log = String::new();
     let ctx = egui::Context::default();
-    // Password-only by default here; the ask-on-connect prompt is tested on its own below.
+    // Unattended (password) access on, so most checks below log in with the password.
     let mut host_cfg = config::Config::fresh();
-    host_cfg.ask_on_connect = false;
+    host_cfg.unattended = true;
     let password = host_cfg.password.clone();
     let host = net::Net::start(host_cfg, ctx.clone()).expect("start host");
     let host_id = host.shared.lock().unwrap().my_id.clone();
@@ -184,6 +184,7 @@ fn selftest(log_path: &str) {
     writeln!(log, "machine key stable across loads: {}", machine == again).ok();
     writeln!(log, "this machine's permanent short id: {}", shortid::format(&shortid::short_id_for(&machine))).ok();
 
+    let pw = |p: &str| net::Login::Password { password: p.into(), remember: false };
     let wait = |what: &dyn Fn() -> bool, secs: u64| {
         let start = Instant::now();
         while !what() && start.elapsed() < Duration::from_secs(secs) {
@@ -200,7 +201,7 @@ fn selftest(log_path: &str) {
     writeln!(log, "host short id {} after {t:?}", shortid::format(&short)).ok();
     // Give the alias endpoint time to publish its record.
     std::thread::sleep(Duration::from_secs(8));
-    let v = ctl.connect(shortid::format(&short), "wrong-password".into());
+    let v = ctl.connect(shortid::format(&short), pw("wrong-password"));
     let t = wait(&|| v.lock().unwrap().status != net::ViewStatus::Connecting, 60);
     let status = match &v.lock().unwrap().status {
         net::ViewStatus::Failed(m) => format!("Failed({m})"),
@@ -210,7 +211,7 @@ fn selftest(log_path: &str) {
     writeln!(log, "wrong password -> {status} after {t:?}").ok();
 
     // Cancel while connecting: nothing may keep streaming afterwards.
-    let c = ctl.connect(shortid::format(&short), password.clone());
+    let c = ctl.connect(shortid::format(&short), pw(&password));
     std::thread::sleep(Duration::from_millis(300));
     c.lock().unwrap().disconnect();
     std::thread::sleep(Duration::from_secs(12));
@@ -227,7 +228,7 @@ fn selftest(log_path: &str) {
         .ok();
     }
     let resolve_start = Instant::now();
-    let v = ctl.connect(shortid::format(&short), password.clone());
+    let v = ctl.connect(shortid::format(&short), pw(&password));
     let t = wait(&|| v.lock().unwrap().frames >= 1, 60);
     writeln!(log, "first frame via short id after {t:?} (total {:?}), status ok={}", resolve_start.elapsed(), v.lock().unwrap().status == net::ViewStatus::Connected).ok();
     writeln!(log, "resolved peer id matches: {}", v.lock().unwrap().peer_id == host_id).ok();
@@ -324,21 +325,21 @@ fn selftest(log_path: &str) {
     };
     writeln!(log, "presence of host: {presence} after {t:?}").ok();
 
-    // Accept/deny prompt: with ask_on_connect on, a correct password still needs the host to
-    // allow it; denying yields the DENIED error on the controller.
-    host.shared.lock().unwrap().cfg.ask_on_connect = true;
-    let d = ctl.connect(shortid::format(&short), password.clone());
+    // Connection request without a password: the host sees the accept window; dismissing it
+    // yields DENIED on the controller.
+    let d = ctl.connect(shortid::format(&short), net::Login::Request);
     wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
     let got_request = !host.shared.lock().unwrap().requests.is_empty();
+    let waiting = d.lock().unwrap().wait == net::Wait::Accept;
     if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
         req.answer(None);
     }
     wait(&|| matches!(d.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
     let denied = matches!(&d.lock().unwrap().status, net::ViewStatus::Failed(m) if m == proto::DENIED);
-    writeln!(log, "ask-on-connect: prompt shown={got_request} deny produced DENIED={denied}").ok();
+    writeln!(log, "request: accept window shown={got_request} controller waiting={waiting} dismiss gives DENIED={denied}").ok();
 
-    // Grant view-only (control off): the controller should connect and see perms.control=false.
-    let vo = ctl.connect(shortid::format(&short), password.clone());
+    // Accept view-only (control off): the controller connects and sees perms.control=false.
+    let vo = ctl.connect(shortid::format(&short), net::Login::Request);
     wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
     if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
         req.answer(Some(proto::Permissions { control: false, clipboard: true, files: false, admin: false }));
@@ -347,12 +348,77 @@ fn selftest(log_path: &str) {
     let p = vo.lock().unwrap().perms;
     writeln!(log, "view-only grant: connected={} control={} files={}", vo.lock().unwrap().status == net::ViewStatus::Connected, p.control, p.files).ok();
     vo.lock().unwrap().disconnect();
-    host.shared.lock().unwrap().cfg.ask_on_connect = false;
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Typing the password while the accept window is up gets in without anyone accepting, and
+    // "log in automatically" hands back a token.
+    let up = ctl.connect(shortid::format(&short), net::Login::Request);
+    wait(&|| up.lock().unwrap().wait == net::Wait::Accept, 30);
+    up.lock().unwrap().send_password(password.clone(), true);
+    wait(&|| up.lock().unwrap().status == net::ViewStatus::Connected, 30);
+    let token = up.lock().unwrap().token.clone();
+    writeln!(
+        log,
+        "password while waiting: connected={} token issued={} host request cleared={}",
+        up.lock().unwrap().status == net::ViewStatus::Connected,
+        !token.is_empty(),
+        host.shared.lock().unwrap().requests.is_empty()
+    )
+    .ok();
+    up.lock().unwrap().disconnect();
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The token logs in directly next time.
+    let tk = ctl.connect(shortid::format(&short), net::Login::Token(token.clone()));
+    wait(&|| tk.lock().unwrap().status != net::ViewStatus::Connecting, 30);
+    writeln!(log, "token login: connected={}", tk.lock().unwrap().status == net::ViewStatus::Connected).ok();
+    tk.lock().unwrap().disconnect();
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Changing the password revokes tokens: the old token falls back to asking.
+    {
+        let mut sh = host.shared.lock().unwrap();
+        sh.cfg.password = "changed-password".into();
+        sh.cfg.tokens.clear();
+    }
+    let old = ctl.connect(shortid::format(&short), net::Login::Token(token));
+    wait(&|| old.lock().unwrap().wait == net::Wait::Accept, 30);
+    let fell_back = old.lock().unwrap().wait == net::Wait::Accept && old.lock().unwrap().token_rejected;
+    old.lock().unwrap().disconnect();
+    std::thread::sleep(Duration::from_secs(1));
+    writeln!(log, "revoked token falls back to the accept window={fell_back} host request cleared on cancel={}", host.shared.lock().unwrap().requests.is_empty()).ok();
+    host.shared.lock().unwrap().cfg.password = password.clone();
+
+    // "Never show requests": the controller is asked for the password instead.
+    host.shared.lock().unwrap().cfg.interactive = config::Interactive::Never;
+    let np = ctl.connect(shortid::format(&short), net::Login::Request);
+    wait(&|| np.lock().unwrap().wait == net::Wait::Password, 30);
+    let asked = np.lock().unwrap().wait == net::Wait::Password;
+    np.lock().unwrap().send_password(password.clone(), false);
+    wait(&|| np.lock().unwrap().status != net::ViewStatus::Connecting, 30);
+    writeln!(log, "requests off: asked for password={asked} then connected={}", np.lock().unwrap().status == net::ViewStatus::Connected).ok();
+    np.lock().unwrap().disconnect();
+    std::thread::sleep(Duration::from_secs(1));
+
+    // ...and with password access off too, nothing gets in.
+    host.shared.lock().unwrap().cfg.unattended = false;
+    let no = ctl.connect(shortid::format(&short), net::Login::Request);
+    wait(&|| matches!(no.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
+    let refused = matches!(&no.lock().unwrap().status, net::ViewStatus::Failed(m) if m == proto::NO_ACCESS);
+    let nopw = ctl.connect(shortid::format(&short), pw(&password));
+    wait(&|| matches!(nopw.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
+    let pw_refused = matches!(&nopw.lock().unwrap().status, net::ViewStatus::Failed(m) if m == proto::WRONG_PASSWORD);
+    writeln!(log, "requests and passwords off: request refused={refused} password refused={pw_refused}").ok();
+    {
+        let mut sh = host.shared.lock().unwrap();
+        sh.cfg.unattended = true;
+        sh.cfg.interactive = config::Interactive::Always;
+    }
 
     // Lockout: 5 wrong passwords lock the peer, so the 6th attempt is refused as "locked".
     let mut saw_locked = false;
     for i in 0..6 {
-        let bad = ctl.connect(shortid::format(&short), format!("nope-{i}"));
+        let bad = ctl.connect(shortid::format(&short), pw(&format!("nope-{i}")));
         wait(&|| matches!(bad.lock().unwrap().status, net::ViewStatus::Failed(_)), 30);
         if let net::ViewStatus::Failed(msg) = &bad.lock().unwrap().status {
             if msg == proto::LOCKED {

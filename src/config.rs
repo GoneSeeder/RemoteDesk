@@ -10,8 +10,13 @@ pub struct Contact {
     #[serde(default)]
     pub short_id: String,
     pub name: String,
+    /// Only from older versions, which saved the password itself. The next login with it is
+    /// turned into a token and this is cleared.
     #[serde(default)]
     pub password: String,
+    /// Automatic-login token the other machine gave us ("log in automatically from now on").
+    #[serde(default)]
+    pub token: String,
     /// Name the user gave this machine; shown instead of its computer name when set.
     #[serde(default)]
     pub alias: String,
@@ -39,16 +44,65 @@ pub struct Config {
     pub short_id_key: String,
     #[serde(default)]
     pub contacts: Vec<Contact>,
-    /// Ask the person at this machine to allow each incoming session (in addition to the password).
-    /// Stored under a new key so installs that saved the old default (off) start asking too.
-    #[serde(default = "yes", rename = "ask_before_connect")]
-    pub ask_on_connect: bool,
+    /// When someone connects without a password, whether to show the accept window.
+    #[serde(default)]
+    pub interactive: Interactive,
+    /// Unattended access: a correct password connects without anyone accepting. Off for new
+    /// installs; on for older ones (missing key), which always worked this way.
+    #[serde(default = "yes")]
+    pub unattended: bool,
+    /// What a password (or automatic-login token) login may do.
+    #[serde(default)]
+    pub unattended_profile: Profile,
+    /// Automatic-login tokens handed out; changing the password clears them.
+    #[serde(default)]
+    pub tokens: Vec<Token>,
     /// Start RemoteDesk automatically when Windows starts.
     #[serde(default)]
     pub start_with_windows: bool,
     /// Only used by the self-test, which runs two identities in one process.
     #[serde(skip)]
     key_override: Option<[u8; 32]>,
+}
+
+/// When to show the accept window for a connection request without a password.
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Interactive {
+    #[default]
+    Always,
+    /// Only while a RemoteDesk window is open on screen; otherwise the request is refused.
+    WhenOpen,
+    /// Never; only unattended (password) access works.
+    Never,
+}
+
+/// Permission profile for unattended (password) access.
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Profile {
+    ViewOnly,
+    /// Control, clipboard and files, but not programs running as administrator.
+    Normal,
+    #[default]
+    Full,
+}
+
+impl Profile {
+    pub fn perms(self) -> crate::proto::Permissions {
+        use crate::proto::Permissions;
+        match self {
+            Profile::ViewOnly => Permissions { control: false, clipboard: false, files: false, admin: false },
+            Profile::Normal => Permissions { admin: false, ..Permissions::all() },
+            Profile::Full => Permissions::all(),
+        }
+    }
+}
+
+/// An automatic-login token given to one controlling machine.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Token {
+    pub peer: String,
+    pub name: String,
+    pub token: String,
 }
 
 /// The %APPDATA%\RemoteDesk folder, where config, logs and downloads metadata live.
@@ -67,6 +121,11 @@ fn path() -> PathBuf {
 
 pub fn thumb_path(id: &str) -> PathBuf {
     dir().join("thumbs").join(format!("{}.jpg", &id[..id.len().min(64)]))
+}
+
+/// A long random secret for automatic login.
+pub fn random_token() -> String {
+    (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect()
 }
 
 pub fn random_password() -> String {
@@ -103,7 +162,10 @@ impl Config {
             short_id: String::new(),
             short_id_key: String::new(),
             contacts: Vec::new(),
-            ask_on_connect: true,
+            interactive: Interactive::Always,
+            unattended: false,
+            unattended_profile: Profile::Full,
+            tokens: Vec::new(),
             start_with_windows: false,
             key_override: None,
         }

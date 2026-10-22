@@ -6,13 +6,15 @@ use sha2::{Digest, Sha256};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/5";
+pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/6";
 pub const ALPN_PING: &[u8] = b"remotedesk/ping/1";
 
 pub const WRONG_PASSWORD: &str = "รหัสผ่านไม่ถูกต้อง";
 pub const NOT_FOUND: &str = "ไม่พบเครื่องนี้ (ID ผิด หรือเครื่องปลายทางไม่ได้เปิดโปรแกรม)";
 pub const DENIED: &str = "เครื่องปลายทางปฏิเสธการเชื่อมต่อ";
 pub const LOCKED: &str = "ใส่รหัสผิดหลายครั้ง ถูกล็อกชั่วคราว กรุณาลองใหม่ภายหลัง";
+pub const NO_ACCESS: &str = "เครื่องปลายทางไม่รับคำขอเชื่อมต่อ และไม่ได้เปิดให้เข้าด้วยรหัสผ่าน";
+pub const NO_ANSWER: &str = "ไม่มีคนกดรับที่เครื่องปลายทาง";
 
 const MAX_MSG: usize = 32 * 1024 * 1024;
 
@@ -26,11 +28,29 @@ pub struct Hello {
 #[derive(Serialize, Deserialize)]
 pub struct Challenge {
     pub nonce: String,
+    /// The host accepts a password (unattended access is on).
+    pub password_login: bool,
 }
 
+/// How the controller asks to get in. It may send `Password` later while waiting for an answer.
 #[derive(Serialize, Deserialize)]
-pub struct Auth {
-    pub proof: String,
+pub enum Auth {
+    /// No password: ask the person at the host to accept.
+    Request,
+    /// `remember` asks for an automatic-login token for next time.
+    Password { proof: String, remember: bool },
+    /// Automatic login with a token from an earlier password login.
+    Token { proof: String },
+}
+
+/// The host's answers during login.
+#[derive(Serialize, Deserialize)]
+pub enum AuthReply {
+    /// The accept window is showing on the host.
+    Waiting,
+    /// The host doesn't take requests right now; a password is required.
+    NeedPassword,
+    Done(Welcome),
 }
 
 pub fn auth_proof(password: &str, nonce: &str, host_id: &str, client_id: &str) -> String {
@@ -52,6 +72,9 @@ pub struct Welcome {
     /// What the controller is allowed to do (chosen by the controlled user, or all-on).
     #[serde(default = "Permissions::all")]
     pub perms: Permissions,
+    /// New automatic-login token, when the controller asked to be remembered.
+    #[serde(default)]
+    pub token: String,
 }
 
 /// What an incoming controller may do on the controlled machine.

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::capture::{Capturer, Geometry};
-use crate::config::Config;
+use crate::config::{Config, Interactive};
 use crate::input::{self, Cmd};
 use crate::proto::*;
 use crate::shortid;
@@ -108,6 +108,26 @@ impl AccessRequest {
     }
 }
 
+/// How the controller logs in.
+pub enum Login {
+    /// Ask the person at the other machine to accept.
+    Request,
+    Password { password: String, remember: bool },
+    Token(String),
+}
+
+/// What the controller is waiting for while connecting.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Wait {
+    Connecting,
+    /// The other machine shows the accept window.
+    Accept,
+    /// The other machine needs the password.
+    Password,
+    /// A password was sent; waiting for the result.
+    Checking,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum ViewStatus {
     Connecting,
@@ -142,12 +162,33 @@ pub struct Viewer {
     pub chat: Vec<ChatMsg>,
     /// Where the person at the controlled machine last moved their own mouse, and when.
     pub host_cursor: Option<(f32, f32, std::time::Instant)>,
+    pub wait: Wait,
+    /// The other machine accepts a password (so "use password" makes sense while waiting).
+    pub password_login: bool,
+    /// Automatic-login token received for next time.
+    pub token: String,
+    /// We tried a saved token and the other machine no longer accepts it.
+    pub token_rejected: bool,
+    /// Sends a password typed while waiting for the accept window.
+    auth_tx: Option<mpsc::UnboundedSender<(String, bool)>>,
+    /// The connection while still logging in, so cancelling closes it (and the other side's
+    /// accept window) right away.
+    connecting: Option<Connection>,
     conn: Option<Connection>,
 }
 
 impl Viewer {
     pub fn connection(&self) -> Option<Connection> {
         self.conn.clone()
+    }
+
+    /// Logs in with a password while the connection is waiting to be accepted.
+    pub fn send_password(&mut self, password: String, remember: bool) {
+        if let Some(tx) = &self.auth_tx {
+            if tx.send((password, remember)).is_ok() {
+                self.wait = Wait::Checking;
+            }
+        }
     }
 
     pub fn send(&self, input: Input) {
@@ -166,7 +207,7 @@ impl Viewer {
     }
 
     pub fn disconnect(&mut self) {
-        if let Some(conn) = self.conn.take() {
+        if let Some(conn) = self.conn.take().or_else(|| self.connecting.take()) {
             conn.close(0u32.into(), b"bye");
         }
         self.input = None;
@@ -251,7 +292,7 @@ impl Net {
         }
     }
 
-    pub fn connect(&self, peer_id: String, password: String) -> Arc<Mutex<Viewer>> {
+    pub fn connect(&self, peer_id: String, login: Login) -> Arc<Mutex<Viewer>> {
         let viewer = Arc::new(Mutex::new(Viewer {
             peer_id: peer_id.clone(),
             peer_short: String::new(),
@@ -266,12 +307,18 @@ impl Net {
             input: None,
             chat: Vec::new(),
             host_cursor: None,
+            wait: Wait::Connecting,
+            password_login: false,
+            token: String::new(),
+            token_rejected: false,
+            auth_tx: None,
+            connecting: None,
             conn: None,
         }));
         let my_name = self.shared.lock().unwrap().cfg.device_name.clone();
         let (ep, v, cx, sh) = (self.endpoint.clone(), viewer.clone(), self.ctx.clone(), self.shared.clone());
         self.rt.spawn(async move {
-            let result = run_viewer(&ep, &peer_id, password, my_name, &v, &cx, &sh).await;
+            let result = run_viewer(&ep, &peer_id, login, my_name, &v, &cx, &sh).await;
             let mut v = v.lock().unwrap();
             if v.status == ViewStatus::Connecting {
                 let msg = match result {
@@ -305,7 +352,7 @@ fn friendly_error(e: &anyhow::Error) -> String {
 async fn run_viewer(
     ep: &Endpoint,
     peer_id: &str,
-    password: String,
+    login: Login,
     my_name: String,
     viewer: &Arc<Mutex<Viewer>>,
     ctx: &egui::Context,
@@ -314,12 +361,60 @@ async fn run_viewer(
     let peer = resolve(ep, peer_id).await?;
     viewer.lock().unwrap().peer_id = peer.to_string();
     let conn = timeout(CONNECT_TIMEOUT, ep.connect(peer, ALPN_CTL)).await??;
+    {
+        let mut v = viewer.lock().unwrap();
+        if v.status == ViewStatus::Closed {
+            conn.close(0u32.into(), b"cancelled");
+            return Ok(());
+        }
+        v.connecting = Some(conn.clone());
+    }
     let (mut send, mut recv) = conn.open_bi().await?;
     write_json(&mut send, &Hello { name: my_name }).await?;
     let challenge: Challenge = timeout(CONNECT_TIMEOUT, read_json(&mut recv)).await??;
-    let proof = auth_proof(&password, &challenge.nonce, &peer.to_string(), &ep.id().to_string());
-    write_json(&mut send, &Auth { proof }).await?;
-    let welcome: Welcome = timeout(CONNECT_TIMEOUT, read_json(&mut recv)).await??;
+    let (host_id, my_id) = (peer.to_string(), ep.id().to_string());
+    let proof = |secret: &str| auth_proof(secret, &challenge.nonce, &host_id, &my_id);
+    let used_token = matches!(login, Login::Token(_));
+    let first = match &login {
+        Login::Request => Auth::Request,
+        Login::Password { password, remember } => Auth::Password { proof: proof(password), remember: *remember },
+        Login::Token(token) => Auth::Token { proof: proof(token) },
+    };
+    write_json(&mut send, &first).await?;
+    let (atx, mut arx) = mpsc::unbounded_channel::<(String, bool)>();
+    {
+        let mut v = viewer.lock().unwrap();
+        v.password_login = challenge.password_login;
+        v.auth_tx = Some(atx);
+    }
+    // Wait for the answer; the user may type the password meanwhile. The host gives up on its
+    // own after a minute or two, so this only guards against a host that never answers.
+    let welcome = timeout(Duration::from_secs(300), async {
+        loop {
+            tokio::select! {
+                reply = read_json::<AuthReply>(&mut recv) => {
+                    let wait = match reply? {
+                        AuthReply::Done(w) => return anyhow::Ok(w),
+                        AuthReply::Waiting => Wait::Accept,
+                        AuthReply::NeedPassword => Wait::Password,
+                    };
+                    let mut v = viewer.lock().unwrap();
+                    v.wait = wait;
+                    v.token_rejected |= used_token;
+                    ctx.request_repaint();
+                }
+                Some((password, remember)) = arx.recv() => {
+                    write_json(&mut send, &Auth::Password { proof: proof(&password), remember }).await?;
+                }
+            }
+        }
+    })
+    .await??;
+    {
+        let mut v = viewer.lock().unwrap();
+        v.auth_tx = None;
+        v.connecting = None;
+    }
     if !welcome.ok {
         bail!(welcome.msg);
     }
@@ -402,6 +497,7 @@ async fn run_viewer(
         v.peer_name = welcome.name;
         v.peer_short = welcome.short;
         v.perms = welcome.perms;
+        v.token = welcome.token;
         v.input = Some(tx);
         v.conn = Some(conn.clone());
     }
@@ -581,73 +677,147 @@ async fn serve_control(
     let (mut send, mut recv) = conn.accept_bi().await?;
     let hello: Hello = timeout(Duration::from_secs(15), read_json(&mut recv)).await??;
     let nonce: String = (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
-    write_json(&mut send, &Challenge { nonce: nonce.clone() }).await?;
-    let auth: Auth = timeout(Duration::from_secs(15), read_json(&mut recv)).await??;
     let peer = conn.remote_id().to_string();
-    let (expected, my_name, short, my_id, ask) = {
+    let (cfg, short, my_id) = {
         let s = shared.lock().unwrap();
-        (
-            s.cfg.password.clone(),
-            s.cfg.device_name.clone(),
-            s.short_id.clone().unwrap_or_default(),
-            s.my_id.clone(),
-            s.cfg.ask_on_connect,
-        )
+        (s.cfg.clone(), s.short_id.clone().unwrap_or_default(), s.my_id.clone())
+    };
+    let my_name = cfg.device_name.clone();
+    write_json(&mut send, &Challenge { nonce: nonce.clone(), password_login: cfg.unattended }).await?;
+    let refuse = |msg: &str| Welcome {
+        ok: false,
+        msg: msg.into(),
+        name: my_name.clone(),
+        short: short.clone(),
+        perms: Permissions::all(),
+        token: String::new(),
     };
 
     // Locked out from too many wrong passwords?
     if let Some(remaining) = security::lockout_remaining(&peer) {
         security::log("locked", &peer, &hello.name, &format!("{}s remaining", remaining.as_secs()));
-        write_json(&mut send, &Welcome { ok: false, msg: LOCKED.into(), name: my_name, short, perms: Permissions::all() }).await?;
+        write_json(&mut send, &AuthReply::Done(refuse(LOCKED))).await?;
         send.finish()?;
         let _ = timeout(Duration::from_secs(3), conn.closed()).await;
         return Ok(());
     }
 
-    let wanted = auth_proof(&expected, &nonce, &my_id, &peer);
-    if expected.is_empty() || auth.proof != wanted {
-        let lock = security::record_failure(&peer);
-        let detail = lock.map(|d| format!("locked for {}s", d.as_secs())).unwrap_or_default();
-        security::log("wrong-password", &peer, &hello.name, &detail);
-        // Slow down password guessing.
-        sleep(Duration::from_secs(2)).await;
-        let msg = if lock.is_some() { LOCKED } else { WRONG_PASSWORD };
-        write_json(&mut send, &Welcome { ok: false, msg: msg.into(), name: my_name, short, perms: Permissions::all() }).await?;
-        send.finish()?;
-        let _ = timeout(Duration::from_secs(3), conn.closed()).await;
-        return Ok(());
-    }
-    security::record_success(&peer);
-
-    // Optional: ask the person at this machine to allow the session and choose permissions.
-    let mut perms = Permissions::all();
-    if ask {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let req_id = session;
-        shared.lock().unwrap().requests.push(AccessRequest {
-            id: req_id,
-            name: hello.name.clone(),
-            peer: peer.clone(),
-            reply: Some(tx),
-        });
-        ctx.request_repaint();
-        let answer = timeout(Duration::from_secs(30), rx).await.ok().and_then(|r| r.ok()).flatten();
-        shared.lock().unwrap().requests.retain(|r| r.id != req_id);
-        ctx.request_repaint();
-        match answer {
-            Some(p) => perms = p,
-            None => {
-                security::log("denied", &peer, &hello.name, "");
-                write_json(&mut send, &Welcome { ok: false, msg: DENIED.into(), name: my_name, short, perms: Permissions::all() }).await?;
-                send.finish()?;
-                let _ = timeout(Duration::from_secs(3), conn.closed()).await;
-                return Ok(());
+    // Like AnyDesk: a correct password (or an automatic-login token from one) connects straight
+    // away with the unattended profile; without one, the person here accepts or dismisses, and
+    // the controller may still type the password while waiting.
+    let mut auth: Auth = timeout(Duration::from_secs(15), read_json(&mut recv)).await??;
+    let granted: std::result::Result<(Permissions, String, &str), &str> = loop {
+        match auth {
+            Auth::Token { proof } => {
+                let valid = cfg.unattended
+                    && cfg.tokens.iter().any(|t| t.peer == peer && auth_proof(&t.token, &nonce, &my_id, &peer) == proof);
+                if valid {
+                    security::record_success(&peer);
+                    break Ok((cfg.unattended_profile.perms(), String::new(), "token"));
+                }
+                // Revoked (password changed or tokens cleared): ask instead.
+                auth = Auth::Request;
+            }
+            Auth::Password { proof, remember } => {
+                let right = cfg.unattended
+                    && !cfg.password.is_empty()
+                    && proof == auth_proof(&cfg.password, &nonce, &my_id, &peer);
+                if !right {
+                    let lock = security::record_failure(&peer);
+                    let detail = lock.map(|d| format!("locked for {}s", d.as_secs())).unwrap_or_default();
+                    security::log("wrong-password", &peer, &hello.name, &detail);
+                    // Slow down password guessing.
+                    sleep(Duration::from_secs(2)).await;
+                    break Err(if lock.is_some() { LOCKED } else { WRONG_PASSWORD });
+                }
+                security::record_success(&peer);
+                let mut token = String::new();
+                if remember {
+                    token = crate::config::random_token();
+                    let mut s = shared.lock().unwrap();
+                    s.cfg.tokens.retain(|t| t.peer != peer);
+                    s.cfg.tokens.push(crate::config::Token { peer: peer.clone(), name: hello.name.clone(), token: token.clone() });
+                    s.cfg.save();
+                }
+                break Ok((cfg.unattended_profile.perms(), token, "password"));
+            }
+            Auth::Request => {
+                let can_ask = match cfg.interactive {
+                    Interactive::Always => true,
+                    Interactive::WhenOpen => crate::localinput::own_window_open(),
+                    Interactive::Never => false,
+                };
+                if !can_ask {
+                    if !cfg.unattended {
+                        security::log("refused", &peer, &hello.name, "requests off, no password access");
+                        break Err(NO_ACCESS);
+                    }
+                    write_json(&mut send, &AuthReply::NeedPassword).await?;
+                    match timeout(Duration::from_secs(120), read_json::<Auth>(&mut recv)).await {
+                        Ok(Ok(next @ Auth::Password { .. })) => {
+                            auth = next;
+                            continue;
+                        }
+                        _ => break Err(DENIED),
+                    }
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                shared.lock().unwrap().requests.push(AccessRequest {
+                    id: session,
+                    name: hello.name.clone(),
+                    peer: peer.clone(),
+                    reply: Some(tx),
+                });
+                ctx.request_repaint();
+                write_json(&mut send, &AuthReply::Waiting).await?;
+                enum Next {
+                    Answer(Option<Permissions>),
+                    NoAnswer,
+                    Controller(Result<Auth>),
+                }
+                let next = tokio::select! {
+                    answer = timeout(Duration::from_secs(60), rx) => match answer {
+                        Ok(r) => Next::Answer(r.ok().flatten()),
+                        Err(_) => Next::NoAnswer,
+                    },
+                    a = read_json::<Auth>(&mut recv) => Next::Controller(a),
+                };
+                shared.lock().unwrap().requests.retain(|r| r.id != session);
+                ctx.request_repaint();
+                match next {
+                    Next::Answer(Some(p)) => break Ok((p, String::new(), "accepted")),
+                    Next::Answer(None) => {
+                        security::log("denied", &peer, &hello.name, "");
+                        break Err(DENIED);
+                    }
+                    Next::NoAnswer => {
+                        security::log("denied", &peer, &hello.name, "no answer");
+                        break Err(NO_ANSWER);
+                    }
+                    // The controller typed the password instead of waiting.
+                    Next::Controller(Ok(next @ Auth::Password { .. })) => {
+                        auth = next;
+                        continue;
+                    }
+                    // Cancelled (or anything unexpected).
+                    Next::Controller(_) => break Err(DENIED),
+                }
             }
         }
-    }
-
-    security::log("connected", &peer, &hello.name, "");
-    write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short, perms }).await?;
+    };
+    let (perms, token) = match granted {
+        Ok((perms, token, how)) => {
+            security::log("connected", &peer, &hello.name, how);
+            (perms, token)
+        }
+        Err(msg) => {
+            let _ = write_json(&mut send, &AuthReply::Done(refuse(msg))).await;
+            let _ = send.finish();
+            let _ = timeout(Duration::from_secs(3), conn.closed()).await;
+            return Ok(());
+        }
+    };
+    write_json(&mut send, &AuthReply::Done(Welcome { ok: true, msg: String::new(), name: my_name, short, perms, token })).await?;
 
     let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<String>();
     let (perms_tx, perms) = tokio::sync::watch::channel(perms);

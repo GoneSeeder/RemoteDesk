@@ -7,7 +7,8 @@ Remote desktop for Windows. Machines connect peer-to-peer over [iroh](https://gi
 - Permanent 10-digit ID tied to the machine, with online status for saved contacts
 - Mouse and keyboard control, including the Windows key and Alt+Tab
 - Copy text and files between machines, and chat during a session
-- The remote side can accept a connection and choose permissions, or allow access by password
+- Connect without a password and the remote side accepts (as administrator or normal) and chooses permissions, which it can change during the session
+- Unattended access: a password set on the remote side connects without anyone accepting, with a chosen permission profile; "log in automatically" saves a token instead of the password
 - Access log and temporary lockout after repeated wrong passwords
 - Automatic updates with signature verification
 

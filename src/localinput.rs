@@ -192,6 +192,27 @@ fn shell_execute(verb: &str, exe: &std::path::Path) -> bool {
     r as isize > 32
 }
 
+/// Whether a RemoteDesk window is open on screen (shown and not minimized).
+pub fn own_window_open() -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible};
+    unsafe extern "system" fn check(hwnd: HWND, found: LPARAM) -> i32 {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                *(found as *mut bool) = true;
+                return 0; // stop
+            }
+        }
+        1
+    }
+    let mut found = false;
+    unsafe { EnumWindows(Some(check), &mut found as *mut bool as LPARAM) };
+    found
+}
+
 /// Whether the window under the mouse belongs to a program running as administrator.
 pub fn elevated_at_cursor() -> bool {
     let (x, y) = cursor_pos();

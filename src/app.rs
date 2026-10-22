@@ -7,9 +7,9 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
-use crate::config::{Contact, random_password, thumb_path};
+use crate::config::{Contact, Interactive, Profile, random_password, thumb_path};
 use crate::input::vk_for;
-use crate::net::{Net, Presence, ViewStatus, Viewer};
+use crate::net::{Login, Net, Presence, ViewStatus, Viewer, Wait};
 use crate::proto::{Input, WRONG_PASSWORD};
 use crate::shortid;
 use crate::updater::{self, UpdateState, Updater};
@@ -44,13 +44,16 @@ struct Pending {
     remember: bool,
     error: Option<String>,
     focus: bool,
+    /// For the connection that is already waiting (sent over it) rather than a new connection.
+    live: bool,
 }
 
 struct Session {
     viewer: Arc<Mutex<Viewer>>,
     label: String,
-    password: String,
     remember: bool,
+    /// The password dialog was opened automatically because the other side asked for it.
+    pw_prompted: bool,
     texture: Option<TextureHandle>,
     /// CPU copy of the remote screen, used for the contact-card thumbnail.
     fb: Vec<u8>,
@@ -76,18 +79,29 @@ struct Session {
 #[derive(Default)]
 struct SettingsDraft {
     name: String,
+    interactive: Interactive,
+    unattended: bool,
     password: String,
-    ask_on_connect: bool,
+    confirm: String,
+    profile: Profile,
     start_with_windows: bool,
+    /// Automatic logins given out; cleared on save when `clear_tokens` or the password changed.
+    tokens: usize,
+    clear_tokens: bool,
 }
 
 impl SettingsDraft {
     fn from_cfg(cfg: &crate::config::Config) -> SettingsDraft {
         SettingsDraft {
             name: cfg.device_name.clone(),
+            interactive: cfg.interactive,
+            unattended: cfg.unattended,
             password: cfg.password.clone(),
-            ask_on_connect: cfg.ask_on_connect,
+            confirm: cfg.password.clone(),
+            profile: cfg.unattended_profile,
             start_with_windows: cfg.start_with_windows,
+            tokens: cfg.tokens.len(),
+            clear_tokens: false,
         }
     }
 }
@@ -208,9 +222,17 @@ impl App {
                     remember: true,
                     error: Some("รหัสผ่านไม่ถูกต้อง ลองใหม่อีกครั้ง".into()),
                     focus: false,
+                    live: false,
                 })
             }
-            "settings" => app.settings = Some(SettingsDraft { name: "DESKTOP-Q4221RT".into(), password: "k7m2p9xa".into(), ..Default::default() }),
+            "settings" => app.settings = Some(SettingsDraft {
+                name: "DESKTOP-Q4221RT".into(),
+                unattended: true,
+                password: "k7m2p9xa".into(),
+                confirm: "k7m2p9xa".into(),
+                tokens: 2,
+                ..Default::default()
+            }),
             "access" => {
                 app.net.shared.lock().unwrap().requests.push(crate::net::AccessRequest::preview(
                     "สมชาย โน้ตบุ๊ก",
@@ -223,7 +245,7 @@ impl App {
     }
 
     /// Starts connecting to whatever is in the address bar or on a card.
-    fn request_connect(&mut self, target: String, label: String, saved_password: Option<String>) {
+    fn request_connect(&mut self, target: String, label: String, login: Login) {
         let target = target.trim().to_string();
         if target.is_empty() {
             self.error = Some("กรุณาใส่ ID ของเครื่องปลายทาง".into());
@@ -238,22 +260,19 @@ impl App {
             }
         }
         self.error = None;
-        match saved_password.filter(|p| !p.is_empty()) {
-            Some(pw) => self.start_session(target, label, pw, true),
-            None => {
-                self.pending =
-                    Some(Pending { target, label, password: String::new(), remember: true, error: None, focus: true })
-            }
-        }
+        self.start_session(target, label, login);
     }
 
-    fn start_session(&mut self, target: String, label: String, password: String, remember: bool) {
-        let viewer = self.net.connect(target, password.clone());
+    /// Like AnyDesk: connect without a password and the other side gets an accept window; a saved
+    /// automatic-login token (or a password) gets straight in.
+    fn start_session(&mut self, target: String, label: String, login: Login) {
+        let remember = matches!(login, Login::Password { remember: true, .. } | Login::Token(_));
+        let viewer = self.net.connect(target, login);
         self.session = Some(Session {
             viewer,
             label,
-            password,
             remember,
+            pw_prompted: false,
             texture: None,
             fb: Vec::new(),
             fb_size: [0, 0],
@@ -274,7 +293,8 @@ impl App {
     }
 
     /// Remembers a peer after a successful login so it shows up as a card.
-    fn remember_contact(&self, id: &str, short: &str, name: &str, password: Option<&str>) {
+    /// `token`: a new automatic-login token; `drop_token`: the saved one no longer works.
+    fn remember_contact(&self, id: &str, short: &str, name: &str, token: &str, drop_token: bool) {
         let mut sh = self.net.shared.lock().unwrap();
         let existing = sh.cfg.contacts.iter().position(|c| c.id == id);
         let mut c = match existing {
@@ -285,8 +305,12 @@ impl App {
         if !short.is_empty() {
             c.short_id = short.into();
         }
-        if let Some(pw) = password {
-            c.password = pw.into();
+        // Passwords are never kept: an old saved one was just exchanged for a token (or failed).
+        c.password.clear();
+        if !token.is_empty() {
+            c.token = token.into();
+        } else if drop_token {
+            c.token.clear();
         }
         // Most recent first.
         sh.cfg.contacts.insert(0, c);
@@ -416,8 +440,8 @@ impl App {
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if accent_button(ui, "เชื่อมต่อ").clicked() || enter {
                 let target = self.address.clone();
-                let saved = self.saved_password_for(&target);
-                self.request_connect(target.clone(), target, saved);
+                let login = self.login_for(&target);
+                self.request_connect(target.clone(), target, login);
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -436,20 +460,27 @@ impl App {
         });
     }
 
-    fn saved_password_for(&self, target: &str) -> Option<String> {
+    /// How to log in to a machine: its saved automatic-login token, a password saved by an older
+    /// version (exchanged for a token), or else ask the other side to accept.
+    fn login_for(&self, target: &str) -> Login {
         let digits = shortid::parse_short(target);
         let sh = self.net.shared.lock().unwrap();
-        sh.cfg
+        let c = sh
+            .cfg
             .contacts
             .iter()
-            .find(|c| c.id == target.trim() || (digits.is_some() && digits.as_deref() == Some(c.short_id.as_str())))
-            .map(|c| c.password.clone())
+            .find(|c| c.id == target.trim() || (digits.is_some() && digits.as_deref() == Some(c.short_id.as_str())));
+        match c {
+            Some(c) if !c.token.is_empty() => Login::Token(c.token.clone()),
+            Some(c) if !c.password.is_empty() => Login::Password { password: c.password.clone(), remember: true },
+            _ => Login::Request,
+        }
     }
 
     fn hero(&mut self, ui: &mut egui::Ui) {
-        let (short, password) = {
+        let (short, password, unattended) = {
             let sh = self.net.shared.lock().unwrap();
-            (sh.short_id.clone(), sh.cfg.password.clone())
+            (sh.short_id.clone(), sh.cfg.password.clone(), sh.cfg.unattended)
         };
         egui::Frame::NONE
             .fill(SURFACE)
@@ -497,7 +528,8 @@ impl App {
                                     ui.ctx().copy_text(shortid::format(s));
                                 }
                             }
-                            ui.label(RichText::new("ส่ง ID และรหัสผ่านให้คนที่จะเข้ามาควบคุม").color(MUTED).size(13.0));
+                            let hint = if unattended { "ส่ง ID (และรหัสผ่าน) ให้คนที่จะเข้ามาควบคุม" } else { "ส่ง ID ให้คนที่จะเข้ามาควบคุม" };
+                            ui.label(RichText::new(hint).color(MUTED).size(13.0));
                         });
                     });
                     let side = if narrow { Layout::top_down(Align::Min) } else { Layout::right_to_left(Align::Center) };
@@ -512,6 +544,17 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(if narrow { ui.available_width() } else { 300.0 });
                                 ui.vertical(|ui| {
+                                    if !unattended {
+                                        ui.label(RichText::new("เข้าด้วยรหัสผ่าน").color(MUTED).size(13.0));
+                                        ui.label(RichText::new("ปิดอยู่ ต้องมีคนกดรับทุกครั้ง").color(TEXT).size(15.0));
+                                        if ui.small_button("ตั้งรหัสผ่าน").clicked() {
+                                            let sh = self.net.shared.lock().unwrap();
+                                            let mut d = SettingsDraft::from_cfg(&sh.cfg);
+                                            d.unattended = true;
+                                            self.settings = Some(d);
+                                        }
+                                        return;
+                                    }
                                     ui.label(RichText::new("รหัสผ่าน").color(MUTED).size(13.0));
                                     let shown = if self.show_pw { password.clone() } else { "•".repeat(password.chars().count()) };
                                     ui.label(RichText::new(shown).font(FontId::monospace(22.0)).color(TEXT));
@@ -529,6 +572,7 @@ impl App {
                                         if ui.small_button("สุ่มใหม่").clicked() {
                                             let mut sh = self.net.shared.lock().unwrap();
                                             sh.cfg.password = random_password();
+                                            sh.cfg.tokens.clear();
                                             sh.cfg.save();
                                         }
                                     });
@@ -607,7 +651,8 @@ impl App {
         if let Some(c) = connect {
             let name = c.display_name(None);
             let label = if name.is_empty() { shortid::format(&c.short_id) } else { name };
-            self.request_connect(c.id.clone(), label, Some(c.password.clone()));
+            let login = self.login_for(&c.id);
+            self.request_connect(c.id.clone(), label, login);
         }
     }
 
@@ -760,7 +805,7 @@ impl App {
                 ui.colored_label(DANGER_TEXT, err);
             }
             ui.add_space(6.0);
-            ui.checkbox(&mut p.remember, "จำรหัสผ่านไว้สำหรับครั้งต่อไป");
+            ui.checkbox(&mut p.remember, "เข้าอัตโนมัติตั้งแต่ครั้งนี้ (ครั้งหน้าไม่ต้องใส่รหัสผ่าน)");
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if accent_button(ui, "เชื่อมต่อ").clicked() {
@@ -776,9 +821,22 @@ impl App {
         }
         if go && !p.password.is_empty() {
             let p = self.pending.take().unwrap();
-            self.start_session(p.target, p.label, p.password, p.remember);
+            match &mut self.session {
+                Some(s) if p.live => {
+                    s.remember = p.remember;
+                    s.viewer.lock().unwrap().send_password(p.password, p.remember);
+                }
+                _ => self.start_session(p.target, p.label, Login::Password { password: p.password, remember: p.remember }),
+            }
         } else if cancel {
-            self.pending = None;
+            let live = self.pending.take().is_some_and(|p| p.live);
+            // The other side only takes a password, so there is nothing left to wait for.
+            if let Some(s) = &self.session {
+                let mut v = s.viewer.lock().unwrap();
+                if live && v.wait == Wait::Password {
+                    v.disconnect();
+                }
+            }
         }
     }
 
@@ -790,24 +848,66 @@ impl App {
         };
         let mut save = false;
         let mut close = false;
+        let mut draft_ok = true;
         let modal = egui::Modal::new(egui::Id::unique("settings")).frame(dialog_frame()).show(ctx, |ui| {
-            ui.set_width(420.0);
+            ui.set_width(440.0);
+            ui.set_max_height(ctx.content_rect().height() - 80.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.label(RichText::new("ตั้งค่า").font(bold(18.0)));
             ui.add_space(12.0);
             ui.label(RichText::new("ชื่อเครื่อง (แสดงให้อีกฝั่งเห็น)").color(MUTED));
             ui.add(egui::TextEdit::singleline(&mut draft.name).margin(vec2(10.0, 7.0)).desired_width(f32::INFINITY));
             ui.add_space(8.0);
-            ui.label(RichText::new("รหัสผ่านสำหรับให้คนอื่นเข้าเครื่องนี้").color(MUTED));
-            ui.add(egui::TextEdit::singleline(&mut draft.password).margin(vec2(10.0, 7.0)).desired_width(f32::INFINITY));
-            if draft.password.chars().count() < 4 {
-                ui.colored_label(AMBER, "รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร");
+            ui.add_space(6.0);
+            ui.label(RichText::new("คำขอเชื่อมต่อ (ไม่ใช้รหัสผ่าน)").font(bold(14.5)));
+            ui.radio_value(&mut draft.interactive, Interactive::Always, "แสดงคำขอเชื่อมต่อเสมอ");
+            ui.radio_value(&mut draft.interactive, Interactive::WhenOpen, "แสดงเฉพาะตอนเปิดหน้าต่าง RemoteDesk อยู่");
+            ui.radio_value(&mut draft.interactive, Interactive::Never, "ไม่แสดงเลย (เข้าได้ด้วยรหัสผ่านอย่างเดียว)");
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.checkbox(&mut draft.unattended, RichText::new("เข้าด้วยรหัสผ่านโดยไม่ต้องมีคนกดรับ").font(bold(14.5)));
+            ui.label(RichText::new("ใส่รหัสถูกก็เข้าได้ทันที ตามสิทธิ์ที่เลือกไว้ด้านล่าง").color(MUTED).size(12.0));
+            let mut pw_ok = true;
+            if draft.unattended {
+                ui.add_space(6.0);
+                ui.label(RichText::new("รหัสผ่าน").color(MUTED));
+                ui.add(egui::TextEdit::singleline(&mut draft.password).password(true).margin(vec2(10.0, 7.0)).desired_width(f32::INFINITY));
+                ui.label(RichText::new("ยืนยันรหัสผ่าน").color(MUTED));
+                ui.add(egui::TextEdit::singleline(&mut draft.confirm).password(true).margin(vec2(10.0, 7.0)).desired_width(f32::INFINITY));
+                if draft.password.chars().count() < 4 {
+                    ui.colored_label(AMBER, "รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร");
+                    pw_ok = false;
+                } else if draft.password != draft.confirm {
+                    ui.colored_label(AMBER, "รหัสผ่านสองช่องไม่ตรงกัน");
+                    pw_ok = false;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("สิทธิ์เมื่อเข้าด้วยรหัสผ่าน").color(MUTED));
+                    egui::ComboBox::from_id_salt("profile")
+                        .selected_text(profile_name(draft.profile))
+                        .show_ui(ui, |ui| {
+                            for p in [Profile::Full, Profile::Normal, Profile::ViewOnly] {
+                                ui.selectable_value(&mut draft.profile, p, profile_name(p));
+                            }
+                        });
+                });
+                ui.add_space(6.0);
+                let n = if draft.clear_tokens { 0 } else { draft.tokens };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("เครื่องที่ตั้งเข้าอัตโนมัติไว้: {n}")).color(MUTED).size(12.5));
+                    if n > 0 && ui.small_button("ยกเลิกทั้งหมด").clicked() {
+                        draft.clear_tokens = true;
+                    }
+                });
+                ui.label(RichText::new("เปลี่ยนรหัสผ่านจะยกเลิกการเข้าอัตโนมัติทุกเครื่องด้วย").color(MUTED).size(11.5));
             }
-            ui.add_space(12.0);
+            draft_ok = pw_ok;
+            ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
             ui.checkbox(&mut draft.start_with_windows, "เปิดโปรแกรมอัตโนมัติเมื่อเปิด Windows");
-            ui.checkbox(&mut draft.ask_on_connect, "ถามก่อนทุกครั้งที่มีคนขอเข้าควบคุม");
-            ui.label(RichText::new("ถ้าเปิด ต้องมีคนที่หน้าเครื่องกดอนุญาต การเข้าแบบไม่มีคนดูแลจะใช้ไม่ได้").color(MUTED).size(11.5));
             ui.add_space(6.0);
             if ui.link(RichText::new("เปิดบันทึกการเข้าใช้งาน (access.log)").size(12.5)).clicked() {
                 let path = crate::config::config_dir().join("access.log");
@@ -834,20 +934,30 @@ impl App {
             });
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if accent_button(ui, "บันทึก").clicked() && draft.password.chars().count() >= 4 {
+                if accent_button(ui, "บันทึก").clicked() && draft_ok {
                     save = true;
                 }
                 if ui.add(egui::Button::new("ยกเลิก").min_size(vec2(0.0, 34.0))).clicked() {
                     close = true;
                 }
             });
+            });
         });
         if save {
             let start = draft.start_with_windows;
             let mut sh = self.net.shared.lock().unwrap();
             sh.cfg.device_name = draft.name.trim().to_string();
-            sh.cfg.password = draft.password.clone();
-            sh.cfg.ask_on_connect = draft.ask_on_connect;
+            sh.cfg.interactive = draft.interactive;
+            sh.cfg.unattended = draft.unattended;
+            sh.cfg.unattended_profile = draft.profile;
+            // A new password (or "cancel all") revokes every automatic login, like AnyDesk.
+            if draft.unattended && draft.password != sh.cfg.password {
+                sh.cfg.password = draft.password.clone();
+                sh.cfg.tokens.clear();
+            }
+            if draft.clear_tokens {
+                sh.cfg.tokens.clear();
+            }
             sh.cfg.start_with_windows = start;
             sh.cfg.save();
             drop(sh);
@@ -889,26 +999,53 @@ impl App {
     // ---------------------------------------------------------------- remote session
 
     fn connecting_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(s) = &self.session else { return };
+        let Some(s) = &mut self.session else { return };
         let label = s.label.clone();
+        let (wait, password_login, target) = {
+            let v = s.viewer.lock().unwrap();
+            (v.wait, v.password_login, v.peer_id.clone())
+        };
+        // The other side takes no requests right now: ask for the password once.
+        let mut ask_password = wait == Wait::Password && !s.pw_prompted;
+        if ask_password {
+            s.pw_prompted = true;
+        }
         self.home_ui(ui);
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("connecting")).frame(dialog_frame()).show(ui.ctx(), |ui| {
-            ui.set_width(320.0);
+            ui.set_width(340.0);
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
                 ui.add(egui::Spinner::new().size(34.0).color(ACCENT));
                 ui.add_space(10.0);
-                ui.label(RichText::new("กำลังเชื่อมต่อ").font(bold(17.0)));
-                ui.label(RichText::new(label).color(MUTED));
+                let (title, detail) = match wait {
+                    Wait::Connecting => ("กำลังเชื่อมต่อ", label.clone()),
+                    Wait::Accept => ("รอเครื่องปลายทางกดยอมรับ", label.clone()),
+                    Wait::Password => ("เครื่องปลายทางต้องใช้รหัสผ่าน", label.clone()),
+                    Wait::Checking => ("กำลังตรวจสอบรหัสผ่าน", label.clone()),
+                };
+                ui.label(RichText::new(title).font(bold(17.0)));
+                ui.label(RichText::new(detail).color(MUTED));
                 ui.add_space(12.0);
-                cancel = ui.add(egui::Button::new("ยกเลิก").min_size(vec2(100.0, 32.0))).clicked();
+                ui.horizontal(|ui| {
+                    let password_button = matches!(wait, Wait::Accept | Wait::Password) && password_login;
+                    let w = if password_button { 230.0 } else { 100.0 };
+                    ui.add_space((ui.available_width() - w).max(0.0) / 2.0);
+                    if password_button && ui.add(egui::Button::new("ใช้รหัสผ่าน").min_size(vec2(120.0, 32.0))).clicked() {
+                        ask_password = true;
+                    }
+                    cancel = ui.add(egui::Button::new("ยกเลิก").min_size(vec2(100.0, 32.0))).clicked();
+                });
             });
         });
+        if ask_password && self.pending.is_none() {
+            self.pending = Some(Pending { target, label, password: String::new(), remember: true, error: None, focus: true, live: true });
+        }
         if cancel {
             if let Some(s) = self.session.take() {
                 s.viewer.lock().unwrap().disconnect();
             }
+            self.pending = None;
         }
     }
 
@@ -954,9 +1091,10 @@ impl App {
                         target,
                         label: s.label,
                         password: String::new(),
-                        remember: s.remember,
+                        remember: true,
                         error: Some("รหัสผ่านไม่ถูกต้อง ลองใหม่อีกครั้ง".into()),
                         focus: true,
+                        live: false,
                     });
                 } else {
                     self.error = Some(msg);
@@ -978,9 +1116,12 @@ impl App {
 
         if !s.saved_contact && !name.is_empty() {
             s.saved_contact = true;
-            let pw = s.remember.then(|| s.password.clone());
+            let (token, rejected) = {
+                let v = s.viewer.lock().unwrap();
+                (v.token.clone(), v.token_rejected)
+            };
             let (id, short, nm) = (peer_id.clone(), peer_short.clone(), name.clone());
-            self.remember_contact(&id, &short, &nm, pw.as_deref());
+            self.remember_contact(&id, &short, &nm, &token, rejected);
             self.address.clear();
         }
         let Some(s) = &mut self.session else { return };
@@ -1695,6 +1836,14 @@ fn perm_toggle(ui: &mut egui::Ui, on: &mut bool, icon: PermIcon, tip: &str) {
     }
     let state = if *on { "อนุญาต" } else { "ไม่อนุญาต" };
     resp.on_hover_text(format!("{tip}: {state}"));
+}
+
+fn profile_name(p: Profile) -> &'static str {
+    match p {
+        Profile::Full => "เต็ม (รวมโปรแกรมแอดมิน)",
+        Profile::Normal => "ปกติ (ไม่รวมโปรแกรมแอดมิน)",
+        Profile::ViewOnly => "ดูจออย่างเดียว",
+    }
 }
 
 /// A small white shield centered at `c`.
