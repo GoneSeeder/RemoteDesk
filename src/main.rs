@@ -154,7 +154,9 @@ fn selftest(log_path: &str) {
 
     let mut log = String::new();
     let ctx = egui::Context::default();
-    let host_cfg = config::Config::fresh();
+    // Password-only by default here; the ask-on-connect prompt is tested on its own below.
+    let mut host_cfg = config::Config::fresh();
+    host_cfg.ask_on_connect = false;
     let password = host_cfg.password.clone();
     let host = net::Net::start(host_cfg, ctx.clone()).expect("start host");
     let host_id = host.shared.lock().unwrap().my_id.clone();
