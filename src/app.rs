@@ -63,8 +63,8 @@ struct Session {
     stats_frames: u64,
     fps: f32,
     kbps: f32,
-    /// The "type clipboard" button asked for a paste; type it instead of pressing Ctrl+V.
-    type_paste: bool,
+    /// Modifier keys currently held down on the remote, so we can release them explicitly.
+    sent_mods: egui::Modifiers,
 }
 
 #[derive(Default)]
@@ -118,6 +118,7 @@ impl App {
         // Keep the Windows Run entry in sync with the saved setting.
         crate::autostart::set_enabled(net.shared.lock().unwrap().cfg.start_with_windows);
         crate::tray::start(cc.egui_ctx.clone());
+        crate::singleinstance::start_show_listener(cc.egui_ctx.clone());
         let updater = Updater::start(net.runtime(), cc.egui_ctx.clone());
         Ok(App {
             close_to_tray: true,
@@ -241,7 +242,7 @@ impl App {
             stats_frames: 0,
             fps: 0.0,
             kbps: 0.0,
-            type_paste: false,
+            sent_mods: egui::Modifiers::default(),
         });
     }
 
@@ -1041,7 +1042,7 @@ impl App {
             let hovered = response.hovered() || response.dragged();
 
             let viewer = s.viewer.lock().unwrap();
-            let events = ui.input(|i| i.events.clone());
+            let (events, cur_mods) = ui.input(|i| (i.events.clone(), i.modifiers));
             for event in events {
                 match event {
                     egui::Event::PointerMoved(pos) if hovered => {
@@ -1072,28 +1073,31 @@ impl App {
                         }
                     }
                     egui::Event::Key { key, physical_key, pressed, modifiers, .. } => {
+                        // Keep the remote's modifier keys in sync first, so combos land correctly
+                        // and nothing stays stuck when a modifier is released.
+                        sync_mods(&viewer, &mut s.sent_mods, modifiers);
                         if let Some(vk) = vk_for(physical_key.unwrap_or(key)) {
-                            viewer.send(Input::Key { vk, down: pressed, ctrl: modifiers.ctrl, shift: modifiers.shift, alt: modifiers.alt });
+                            viewer.send(Input::KeyVk { vk, down: pressed });
                         }
                     }
-                    // egui turns Ctrl+C/X/V into these instead of key events.
+                    // egui turns Ctrl+C/X/V into these instead of key events; the Ctrl is already
+                    // held via sync_mods, so just tap the letter.
                     egui::Event::Copy | egui::Event::Cut => {
                         let vk = if matches!(event, egui::Event::Copy) { b'C' } else { b'X' } as u16;
-                        viewer.send(Input::Key { vk, down: true, ctrl: true, shift: false, alt: false });
-                        viewer.send(Input::Key { vk, down: false, ctrl: false, shift: false, alt: false });
+                        sync_mods(&viewer, &mut s.sent_mods, egui::Modifiers { ctrl: true, ..Default::default() });
+                        viewer.send(Input::KeyVk { vk, down: true });
+                        viewer.send(Input::KeyVk { vk, down: false });
                     }
-                    egui::Event::Paste(text) => {
-                        if std::mem::take(&mut s.type_paste) {
-                            viewer.send(Input::Text(text));
-                        } else {
-                            // Clipboards are synced, so a real Ctrl+V pastes on the remote side.
-                            viewer.send(Input::Key { vk: b'V' as u16, down: true, ctrl: true, shift: false, alt: false });
-                            viewer.send(Input::Key { vk: b'V' as u16, down: false, ctrl: false, shift: false, alt: false });
-                        }
+                    egui::Event::Paste(_) => {
+                        sync_mods(&viewer, &mut s.sent_mods, egui::Modifiers { ctrl: true, ..Default::default() });
+                        viewer.send(Input::KeyVk { vk: b'V' as u16, down: true });
+                        viewer.send(Input::KeyVk { vk: b'V' as u16, down: false });
                     }
                     _ => {}
                 }
             }
+            // Final reconcile: release any modifier whose key was let go without an event.
+            sync_mods(&viewer, &mut s.sent_mods, cur_mods);
         });
 
         if disconnect {
@@ -1202,7 +1206,8 @@ impl App {
             let v = s.viewer.lock().unwrap();
             (v.status == ViewStatus::Connected).then(|| v.input.clone()).flatten()
         });
-        let want = focused && tx.is_some() && self.pending.is_none() && self.settings.is_none();
+        // Keys come from this window's own input events (egui), which is reliable for Ctrl shortcuts.
+        let want = false && focused && tx.is_some() && self.pending.is_none() && self.settings.is_none();
         if want != self.capturing_keys {
             self.capturing_keys = want;
             crate::localinput::set_key_capture(tx.filter(|_| want).map(|tx| {
@@ -1362,6 +1367,24 @@ fn drop_overlay(ctx: &egui::Context, text: &str) {
 }
 
 // -------------------------------------------------------------------- drawing helpers
+
+/// Sends press/release for Ctrl/Shift/Alt whenever the modifier state changes, so remote combos
+/// match the controller exactly and no modifier ever sticks.
+fn sync_mods(viewer: &Viewer, sent: &mut egui::Modifiers, now: egui::Modifiers) {
+    const VK_SHIFT: u16 = 0x10;
+    const VK_CONTROL: u16 = 0x11;
+    const VK_MENU: u16 = 0x12;
+    for (want, have, vk) in
+        [(now.ctrl, sent.ctrl, VK_CONTROL), (now.shift, sent.shift, VK_SHIFT), (now.alt, sent.alt, VK_MENU)]
+    {
+        if want != have {
+            viewer.send(Input::KeyVk { vk, down: want });
+        }
+    }
+    sent.ctrl = now.ctrl;
+    sent.shift = now.shift;
+    sent.alt = now.alt;
+}
 
 fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size + 2.0), Sense::hover());

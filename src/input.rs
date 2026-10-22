@@ -133,6 +133,7 @@ fn run(rx: Receiver<Cmd>) {
                     | Input::Button { down: true, .. }
                     | Input::Key { down: true, .. }
                     | Input::RawKey { down: true, .. }
+                    | Input::KeyVk { down: true, .. }
                     | Input::Text(_)
             );
             received += 1;
@@ -198,6 +199,22 @@ fn run(rx: Receiver<Cmd>) {
                 }
             }
             Cmd::Input(_, Input::Clipboard(_)) => {}
+            Cmd::Input(_, Input::KeyVk { vk, down }) => {
+                // Extended keys (arrows, Ins/Del/Home/End, right-side modifiers, numpad /, Win)
+                // must carry the extended flag for Windows to recognise them.
+                let extended = matches!(
+                    vk,
+                    0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0xA3 | 0xA5 | 0x6F | 0x90
+                );
+                if !send_key(vk, 0, extended, down) {
+                    failed += 1;
+                    log(&format!("SendInput(keyvk) failed, error {}", std::io::Error::last_os_error()));
+                }
+                held_raw.retain(|&(v, _, _)| v != vk);
+                if down {
+                    held_raw.push((vk, 0, extended));
+                }
+            }
             Cmd::Input(_, Input::RawKey { vk, scan, extended, down }) => {
                 if !send_key(vk, scan, extended, down) {
                     failed += 1;

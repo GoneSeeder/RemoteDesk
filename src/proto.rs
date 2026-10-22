@@ -73,6 +73,10 @@ pub enum Input {
     /// A physical key exactly as the controller's keyboard reported it (captured with a
     /// low-level hook, so Win/Alt+Tab/etc. reach the remote instead of the local machine).
     RawKey { vk: u16, scan: u16, extended: bool, down: bool },
+    /// Press or release a single virtual key, without the host synthesising modifiers. The
+    /// controller sends modifier keys (Ctrl/Shift/Alt) as their own KeyVk events, so the remote
+    /// state always matches and nothing stays stuck down.
+    KeyVk { vk: u16, down: bool },
 }
 
 /// Messages from the controlled machine on its second uni stream.

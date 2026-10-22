@@ -8,6 +8,7 @@ mod localinput;
 mod net;
 mod proto;
 mod shortid;
+mod singleinstance;
 mod transfer;
 mod tray;
 mod autostart;
@@ -120,6 +121,11 @@ fn main() -> eframe::Result {
             let (out, mode) = (out.clone(), mode.clone());
             return eframe::run_native("RemoteDesk preview", options, Box::new(move |cc| Ok(Box::new(app::App::new_preview(cc, out, &mode)))));
         }
+    }
+    // If RemoteDesk is already running, tell it to show its window and exit instead of adding
+    // a second instance (and a second tray icon).
+    if !singleinstance::acquire() {
+        return Ok(());
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
