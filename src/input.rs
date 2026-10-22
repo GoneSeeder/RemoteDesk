@@ -198,7 +198,7 @@ fn run(rx: Receiver<Cmd>) {
                     let _ = e.text(&text);
                 }
             }
-            Cmd::Input(_, Input::Clipboard(_)) => {}
+            Cmd::Input(_, Input::Clipboard(_)) | Cmd::Input(_, Input::Chat(_)) => {}
             Cmd::Input(_, Input::KeyVk { vk, down }) => {
                 // Extended keys (arrows, Ins/Del/Home/End, right-side modifiers, numpad /, Win)
                 // must carry the extended flag for Windows to recognise them.

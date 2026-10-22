@@ -237,6 +237,25 @@ fn selftest(log_path: &str) {
         }
     }
 
+    // Chat both ways.
+    v.lock().unwrap().send_chat("hi from controller".into());
+    if let Some(inc) = host.shared.lock().unwrap().incoming.first_mut() {
+        inc.send_chat("hi from host".into());
+    }
+    wait(
+        &|| {
+            v.lock().unwrap().chat.len() >= 2
+                && host.shared.lock().unwrap().incoming.first().map(|i| i.chat.len()).unwrap_or(0) >= 2
+        },
+        20,
+    );
+    {
+        let ctl_chat = v.lock().unwrap().chat.len();
+        let host_chat = host.shared.lock().unwrap().incoming.first().map(|i| i.chat.len()).unwrap_or(0);
+        let ctl_got_host = v.lock().unwrap().chat.iter().any(|m| !m.from_me && m.text == "hi from host");
+        writeln!(log, "chat: controller has {ctl_chat} msgs, host has {host_chat} msgs, controller got host msg={ctl_got_host}").ok();
+    }
+
     // File transfer both ways, compared byte for byte.
     let dir = std::env::temp_dir().join("remotedesk-selftest");
     std::fs::create_dir_all(&dir).ok();

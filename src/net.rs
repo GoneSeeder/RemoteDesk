@@ -39,6 +39,25 @@ pub struct Incoming {
     session: u64,
     pub name: String,
     pub conn: Connection,
+    pub chat: Vec<ChatMsg>,
+    /// Sends a chat line from this machine to the controller.
+    chat_tx: mpsc::UnboundedSender<String>,
+}
+
+impl Incoming {
+    /// Sends a chat message to the controller and records it.
+    pub fn send_chat(&mut self, text: String) {
+        if self.chat_tx.send(text.clone()).is_ok() {
+            self.chat.push(ChatMsg { from_me: true, text });
+        }
+    }
+}
+
+/// One line in a session chat.
+#[derive(Clone)]
+pub struct ChatMsg {
+    pub from_me: bool,
+    pub text: String,
 }
 
 pub struct Shared {
@@ -109,6 +128,7 @@ pub struct Viewer {
     pub bytes: u64,
     pub frames: u64,
     pub input: Option<mpsc::UnboundedSender<Input>>,
+    pub chat: Vec<ChatMsg>,
     conn: Option<Connection>,
 }
 
@@ -120,6 +140,15 @@ impl Viewer {
     pub fn send(&self, input: Input) {
         if let Some(tx) = &self.input {
             let _ = tx.send(input);
+        }
+    }
+
+    /// Sends a chat message to the controlled machine and records it.
+    pub fn send_chat(&mut self, text: String) {
+        if let Some(tx) = &self.input {
+            if tx.send(Input::Chat(text.clone())).is_ok() {
+                self.chat.push(ChatMsg { from_me: true, text });
+            }
         }
     }
 
@@ -222,6 +251,7 @@ impl Net {
             bytes: 0,
             frames: 0,
             input: None,
+            chat: Vec::new(),
             conn: None,
         }));
         let my_name = self.shared.lock().unwrap().cfg.device_name.clone();
@@ -309,6 +339,10 @@ async fn run_viewer(
                         HostMsg::Clipboard(text) => clipboard.set(text),
                         HostMsg::LocalActive(busy) => {
                             v.lock().unwrap().remote_busy = busy;
+                            ctx.request_repaint();
+                        }
+                        HostMsg::Chat(text) => {
+                            v.lock().unwrap().chat.push(ChatMsg { from_me: false, text });
                             ctx.request_repaint();
                         }
                     }
@@ -593,10 +627,13 @@ async fn serve_control(
     security::log("connected", &peer, &hello.name, "");
     write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short, perms }).await?;
 
+    let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<String>();
     shared.lock().unwrap().incoming.push(Incoming {
         session,
         name: hello.name,
         conn: conn.clone(),
+        chat: Vec::new(),
+        chat_tx,
     });
     ctx.request_repaint();
 
@@ -640,6 +677,12 @@ async fn serve_control(
                         transfer::ClipItem::Files(_) => {}
                     }
                 }
+                chat = chat_rx.recv() => {
+                    match chat {
+                        Some(text) => write_json(&mut events, &HostMsg::Chat(text)).await?,
+                        None => break,
+                    }
+                }
                 _ = tick.tick() => {
                     let now = crate::localinput::local_active();
                     if now != busy {
@@ -674,6 +717,15 @@ async fn serve_control(
                 if perms.clipboard {
                     clipboard.set(text);
                 }
+                continue;
+            }
+            if let Input::Chat(text) = event {
+                let mut sh = shared.lock().unwrap();
+                if let Some(inc) = sh.incoming.iter_mut().find(|i| i.session == session) {
+                    inc.chat.push(ChatMsg { from_me: false, text });
+                }
+                drop(sh);
+                ctx.request_repaint();
                 continue;
             }
             // When control is not granted the session is view-only: ignore mouse/keyboard.

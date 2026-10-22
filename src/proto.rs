@@ -94,6 +94,8 @@ pub enum Input {
     /// controller sends modifier keys (Ctrl/Shift/Alt) as their own KeyVk events, so the remote
     /// state always matches and nothing stays stuck down.
     KeyVk { vk: u16, down: bool },
+    /// A chat message typed by the controller.
+    Chat(String),
 }
 
 /// Messages from the controlled machine on its second uni stream.
@@ -102,6 +104,8 @@ pub enum HostMsg {
     Clipboard(String),
     /// The person at the controlled machine is using its mouse/keyboard; remote input is paused.
     LocalActive(bool),
+    /// A chat message typed by the controlled machine's user.
+    Chat(String),
 }
 
 /// One H.264 access unit of the remote screen.

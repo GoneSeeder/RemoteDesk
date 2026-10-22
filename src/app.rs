@@ -65,6 +65,8 @@ struct Session {
     kbps: f32,
     /// Modifier keys currently held down on the remote, so we can release them explicitly.
     sent_mods: egui::Modifiers,
+    chat_open: bool,
+    chat_input: String,
 }
 
 #[derive(Default)]
@@ -95,6 +97,9 @@ pub struct App {
     session: Option<Session>,
     settings: Option<SettingsDraft>,
     confirm_delete: Option<Contact>,
+    /// Host-side chat input buffer and open state (for incoming sessions).
+    host_chat_open: bool,
+    host_chat_input: String,
     /// Machine being renamed: (id, draft name, focus the field next frame).
     rename: Option<(String, String, bool)>,
     /// Checkbox state for the incoming-access dialog: (request id, permissions).
@@ -135,6 +140,8 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
+            host_chat_open: false,
+            host_chat_input: String::new(),
             access_draft: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
@@ -179,6 +186,8 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
+            host_chat_open: false,
+            host_chat_input: String::new(),
             access_draft: None,
             thumbs: HashMap::new(),
             gradients: HashMap::new(),
@@ -253,6 +262,8 @@ impl App {
             fps: 0.0,
             kbps: 0.0,
             sent_mods: egui::Modifiers::default(),
+            chat_open: false,
+            chat_input: String::new(),
         });
     }
 
@@ -302,10 +313,30 @@ impl App {
                                 if danger_button(ui, "ตัดการเชื่อมต่อ").clicked() {
                                     conn.close(0u32.into(), b"kicked");
                                 }
+                                if ui.add(egui::Button::new("แชท").min_size(vec2(0.0, 32.0))).clicked() {
+                                    self.host_chat_open = !self.host_chat_open;
+                                }
                             });
                         });
                     }
                 });
+
+            // Host-side chat window for the first incoming session.
+            if self.host_chat_open {
+                let msgs: Vec<(bool, String)> = {
+                    let sh = self.net.shared.lock().unwrap();
+                    sh.incoming.first().map(|i| i.chat.iter().map(|m| (m.from_me, m.text.clone())).collect()).unwrap_or_default()
+                };
+                let who = self.net.shared.lock().unwrap().incoming.first().map(|i| i.name.clone()).unwrap_or_default();
+                let mut open = self.host_chat_open;
+                if let Some(text) = chat_window(&ctx, &format!("แชทกับ {who}"), &msgs, &mut self.host_chat_input, &mut open) {
+                    let mut sh = self.net.shared.lock().unwrap();
+                    if let Some(inc) = sh.incoming.first_mut() {
+                        inc.send_chat(text);
+                    }
+                }
+                self.host_chat_open = open;
+            }
         }
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(ui, |ui| {
@@ -1028,6 +1059,11 @@ impl App {
                             s.fullscreen = !s.fullscreen;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(s.fullscreen));
                         }
+                        let unread = s.viewer.lock().unwrap().chat.iter().any(|m| !m.from_me) && !s.chat_open;
+                        let label = if unread { "แชท ●" } else { "แชท" };
+                        if ui.add(egui::Button::new(label).min_size(vec2(0.0, 32.0))).clicked() {
+                            s.chat_open = !s.chat_open;
+                        }
                     });
                 });
             });
@@ -1113,10 +1149,63 @@ impl App {
             sync_mods(&viewer, &mut s.sent_mods, cur_mods);
         });
 
+        // Chat window (controller side).
+        if s.chat_open {
+            let msgs: Vec<(bool, String)> =
+                s.viewer.lock().unwrap().chat.iter().map(|m| (m.from_me, m.text.clone())).collect();
+            if let Some(text) = chat_window(&ctx, &format!("แชทกับ {name}"), &msgs, &mut s.chat_input, &mut s.chat_open) {
+                s.viewer.lock().unwrap().send_chat(text);
+            }
+        }
+
         if disconnect {
             s.viewer.lock().unwrap().disconnect();
         }
     }
+}
+
+/// A floating chat window. Returns a message to send if the user pressed Enter or Send.
+fn chat_window(
+    ctx: &egui::Context,
+    title: &str,
+    msgs: &[(bool, String)],
+    input: &mut String,
+    open: &mut bool,
+) -> Option<String> {
+    let mut send = None;
+    egui::Window::new(title)
+        .open(open)
+        .default_width(300.0)
+        .default_height(360.0)
+        .anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, -16.0))
+        .frame(dialog_frame())
+        .show(ctx, |ui| {
+            egui::Panel::bottom("chat_input").frame(egui::Frame::NONE.inner_margin(6)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(input).hint_text("พิมพ์ข้อความ...").desired_width(f32::INFINITY),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (enter || ui.button("ส่ง").clicked()) && !input.trim().is_empty() {
+                        send = Some(input.trim().to_string());
+                        input.clear();
+                        r.request_focus();
+                    }
+                });
+            });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                for (from_me, text) in msgs {
+                    let (align, color) = if *from_me { (Align::RIGHT, ACCENT) } else { (Align::LEFT, SURFACE2) };
+                    ui.with_layout(Layout::top_down(align), |ui| {
+                        egui::Frame::NONE.fill(color).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+                            ui.label(RichText::new(text).color(TEXT));
+                        });
+                    });
+                    ui.add_space(3.0);
+                }
+            });
+        });
+    send
 }
 
 enum CardAction {
