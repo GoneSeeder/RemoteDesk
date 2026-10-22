@@ -18,10 +18,18 @@ mod winclip;
 
 use eframe::egui;
 
-const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_128.rgba");
+/// New logo: the exe file, taskbar and window title-bar icon.
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../assets/window_icon_128.rgba");
+/// Old logo: kept for the small header logo drawn inside the app.
+const HEADER_ICON_RGBA: &[u8] = include_bytes!("../assets/icon_128.rgba");
 
 pub fn icon() -> egui::IconData {
-    egui::IconData { rgba: ICON_RGBA.to_vec(), width: 128, height: 128 }
+    egui::IconData { rgba: WINDOW_ICON_RGBA.to_vec(), width: 128, height: 128 }
+}
+
+/// The in-app header logo (kept as the old mark at the user's request).
+pub fn header_icon() -> egui::IconData {
+    egui::IconData { rgba: HEADER_ICON_RGBA.to_vec(), width: 128, height: 128 }
 }
 
 fn main() -> eframe::Result {

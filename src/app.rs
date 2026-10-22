@@ -1542,7 +1542,7 @@ fn filled_button(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response
 }
 
 fn logo_texture(ctx: &egui::Context) -> TextureHandle {
-    let icon = crate::icon();
+    let icon = crate::header_icon();
     let img = ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
     ctx.load_texture("logo", img, TextureOptions::LINEAR)
 }
