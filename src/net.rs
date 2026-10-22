@@ -129,6 +129,8 @@ pub struct Viewer {
     pub frames: u64,
     pub input: Option<mpsc::UnboundedSender<Input>>,
     pub chat: Vec<ChatMsg>,
+    /// Where the person at the controlled machine last moved their own mouse, and when.
+    pub host_cursor: Option<(f32, f32, std::time::Instant)>,
     conn: Option<Connection>,
 }
 
@@ -252,6 +254,7 @@ impl Net {
             frames: 0,
             input: None,
             chat: Vec::new(),
+            host_cursor: None,
             conn: None,
         }));
         let my_name = self.shared.lock().unwrap().cfg.device_name.clone();
@@ -343,6 +346,10 @@ async fn run_viewer(
                         }
                         HostMsg::Chat(text) => {
                             v.lock().unwrap().chat.push(ChatMsg { from_me: false, text });
+                            ctx.request_repaint();
+                        }
+                        HostMsg::Cursor { x, y } => {
+                            v.lock().unwrap().host_cursor = Some((x, y, std::time::Instant::now()));
                             ctx.request_repaint();
                         }
                     }
@@ -661,7 +668,8 @@ async fn serve_control(
     let (clip_id, mut clip_rx) = clipboard.subscribe();
     let clip_out = async {
         let mut busy = false;
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut last_cursor = (i32::MIN, i32::MIN);
+        let mut tick = tokio::time::interval(Duration::from_millis(40));
         loop {
             tokio::select! {
                 item = clip_rx.recv() => {
@@ -688,6 +696,15 @@ async fn serve_control(
                     if now != busy {
                         busy = now;
                         write_json(&mut events, &HostMsg::LocalActive(busy)).await?;
+                    }
+                    // Show the controller where the local user is pointing.
+                    let pos = crate::localinput::cursor_pos();
+                    if now && pos != last_cursor {
+                        last_cursor = pos;
+                        let g: Geometry = *geometry.lock().unwrap();
+                        let x = (pos.0 - g.x) as f32 / g.w.max(1) as f32;
+                        let y = (pos.1 - g.y) as f32 / g.h.max(1) as f32;
+                        write_json(&mut events, &HostMsg::Cursor { x, y }).await?;
                     }
                 }
             }

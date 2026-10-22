@@ -41,6 +41,7 @@ static HELD: Mutex<Vec<(u16, u16, bool)>> = Mutex::new(Vec::new());
 /// Starts or stops sending the local keyboard to the remote. Stopping releases any key the
 /// remote still thinks is held (e.g. Alt when the window lost focus during Alt+Tab).
 pub fn set_key_capture(sink: Option<Box<dyn Fn(Input) + Send>>) {
+    start();
     ensure_forwarder();
     let on = sink.is_some();
     // Flip the atomic first so the hook stops/starts swallowing immediately.
@@ -130,14 +131,17 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize)
 }
 
 /// Installs the low-level hooks on their own thread (hooks need a message loop).
+/// Safe to call more than once: the controller needs the keyboard hook for Win/Alt+Tab, the
+/// controlled machine needs both hooks to detect local use.
 pub fn start() {
-    std::thread::spawn(|| unsafe {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| { std::thread::spawn(|| unsafe {
         let module = std::ptr::null_mut();
         SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0);
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-    });
+    }); });
 }
 
 /// Whether this process runs as administrator. Without it, Windows blocks our clicks and keys
@@ -170,6 +174,13 @@ fn shell_execute(verb: &str, exe: &std::path::Path) -> bool {
         )
     };
     r as isize > 32
+}
+
+/// The mouse position in screen coordinates.
+pub fn cursor_pos() -> (i32, i32) {
+    let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+    (pt.x, pt.y)
 }
 
 /// True while the local user has priority.

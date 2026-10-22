@@ -67,6 +67,8 @@ struct Session {
     sent_mods: egui::Modifiers,
     chat_open: bool,
     chat_input: String,
+    /// Chat messages already seen, so a new one from the other side opens the chat window.
+    chat_seen: usize,
 }
 
 #[derive(Default)]
@@ -98,7 +100,10 @@ pub struct App {
     settings: Option<SettingsDraft>,
     confirm_delete: Option<Contact>,
     /// Host-side chat input buffer and open state (for incoming sessions).
-    host_chat_open: bool,
+    /// The host-side session window was closed by the user; it comes back on the next event.
+    host_win_hidden: bool,
+    /// (request id, sessions, chat messages) last shown in the host window, to spot new events.
+    host_seen: (u64, usize, usize),
     host_chat_input: String,
     /// Machine being renamed: (id, draft name, focus the field next frame).
     rename: Option<(String, String, bool)>,
@@ -140,7 +145,8 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
-            host_chat_open: false,
+            host_win_hidden: false,
+            host_seen: (0, 0, 0),
             host_chat_input: String::new(),
             access_draft: None,
             thumbs: HashMap::new(),
@@ -186,7 +192,8 @@ impl App {
             settings: None,
             confirm_delete: None,
             rename: None,
-            host_chat_open: false,
+            host_win_hidden: false,
+            host_seen: (0, 0, 0),
             host_chat_input: String::new(),
             access_draft: None,
             thumbs: HashMap::new(),
@@ -264,6 +271,7 @@ impl App {
             sent_mods: egui::Modifiers::default(),
             chat_open: false,
             chat_input: String::new(),
+            chat_seen: 0,
         });
     }
 
@@ -314,29 +322,13 @@ impl App {
                                     conn.close(0u32.into(), b"kicked");
                                 }
                                 if ui.add(egui::Button::new("แชท").min_size(vec2(0.0, 32.0))).clicked() {
-                                    self.host_chat_open = !self.host_chat_open;
+                                    self.host_win_hidden = false;
                                 }
                             });
                         });
                     }
                 });
 
-            // Host-side chat window for the first incoming session.
-            if self.host_chat_open {
-                let msgs: Vec<(bool, String)> = {
-                    let sh = self.net.shared.lock().unwrap();
-                    sh.incoming.first().map(|i| i.chat.iter().map(|m| (m.from_me, m.text.clone())).collect()).unwrap_or_default()
-                };
-                let who = self.net.shared.lock().unwrap().incoming.first().map(|i| i.name.clone()).unwrap_or_default();
-                let mut open = self.host_chat_open;
-                if let Some(text) = chat_window(&ctx, &format!("แชทกับ {who}"), &msgs, &mut self.host_chat_input, &mut open) {
-                    let mut sh = self.net.shared.lock().unwrap();
-                    if let Some(inc) = sh.incoming.first_mut() {
-                        inc.send_chat(text);
-                    }
-                }
-                self.host_chat_open = open;
-            }
         }
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(ui, |ui| {
@@ -1087,6 +1079,14 @@ impl App {
             let scale = (avail.width() / tw as f32).min(avail.height() / th as f32);
             let rect = Rect::from_center_size(avail.center(), vec2(tw as f32 * scale, th as f32 * scale));
             ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            // The remote user's own mouse, in purple, while they are moving it.
+            let host_cursor = s.viewer.lock().unwrap().host_cursor;
+            if let Some((x, y, at)) = host_cursor {
+                if at.elapsed().as_secs_f32() < 1.5 && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) {
+                    purple_cursor(ui.painter(), rect.min + vec2(x * rect.width(), y * rect.height()));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
             let response = ui.allocate_rect(rect, Sense::click_and_drag());
             let hovered = response.hovered() || response.dragged();
 
@@ -1149,7 +1149,12 @@ impl App {
             sync_mods(&viewer, &mut s.sent_mods, cur_mods);
         });
 
-        // Chat window (controller side).
+        // Chat window (controller side). A new message from the other side opens it.
+        let theirs = s.viewer.lock().unwrap().chat.iter().filter(|m| !m.from_me).count();
+        if theirs > s.chat_seen {
+            s.chat_open = true;
+        }
+        s.chat_seen = theirs;
         if s.chat_open {
             let msgs: Vec<(bool, String)> =
                 s.viewer.lock().unwrap().chat.iter().map(|m| (m.from_me, m.text.clone())).collect();
@@ -1179,32 +1184,35 @@ fn chat_window(
         .default_height(360.0)
         .anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, -16.0))
         .frame(dialog_frame())
-        .show(ctx, |ui| {
-            egui::Panel::bottom("chat_input").frame(egui::Frame::NONE.inner_margin(6)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let r = ui.add(
-                        egui::TextEdit::singleline(input).hint_text("พิมพ์ข้อความ...").desired_width(f32::INFINITY),
-                    );
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (enter || ui.button("ส่ง").clicked()) && !input.trim().is_empty() {
-                        send = Some(input.trim().to_string());
-                        input.clear();
-                        r.request_focus();
-                    }
+        .show(ctx, |ui| send = chat_body(ui, msgs, input));
+    send
+}
+
+/// Chat history with an input line at the bottom. Returns a message to send.
+fn chat_body(ui: &mut egui::Ui, msgs: &[(bool, String)], input: &mut String) -> Option<String> {
+    let mut send = None;
+    egui::Panel::bottom("chat_input").frame(egui::Frame::NONE.inner_margin(6)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(input).hint_text("พิมพ์ข้อความ...").desired_width(f32::INFINITY));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (enter || ui.button("ส่ง").clicked()) && !input.trim().is_empty() {
+                send = Some(input.trim().to_string());
+                input.clear();
+                r.request_focus();
+            }
+        });
+    });
+    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        for (from_me, text) in msgs {
+            let (align, color) = if *from_me { (Align::RIGHT, ACCENT) } else { (Align::LEFT, SURFACE2) };
+            ui.with_layout(Layout::top_down(align), |ui| {
+                egui::Frame::NONE.fill(color).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+                    ui.label(RichText::new(text).color(TEXT));
                 });
             });
-            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                for (from_me, text) in msgs {
-                    let (align, color) = if *from_me { (Align::RIGHT, ACCENT) } else { (Align::LEFT, SURFACE2) };
-                    ui.with_layout(Layout::top_down(align), |ui| {
-                        egui::Frame::NONE.fill(color).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
-                            ui.label(RichText::new(text).color(TEXT));
-                        });
-                    });
-                    ui.add_space(3.0);
-                }
-            });
-        });
+            ui.add_space(3.0);
+        }
+    });
     send
 }
 
@@ -1260,7 +1268,7 @@ impl eframe::App for App {
             self.home_ui(ui);
         }
         self.transfers_ui(ui.ctx());
-        self.access_request_dialog(ui.ctx());
+        self.host_window(ui.ctx());
         self.update_key_capture(ui.ctx());
     }
 }
@@ -1268,52 +1276,139 @@ impl eframe::App for App {
 impl App {
     /// Grabs the whole keyboard (Win, Alt+Tab, ...) while a connected session window is focused
     /// and no dialog is open; releases it the moment that stops being true.
-    /// Shows the oldest pending "allow this person?" prompt (when ask-on-connect is on).
-    fn access_request_dialog(&mut self, ctx: &egui::Context) {
-        let pending = {
+    /// The AnyDesk-style window on the controlled machine: its own OS window, on top of everything,
+    /// that pops up when someone asks to connect or is connected (even while the app is in the
+    /// tray). Left: who it is, permissions, Accept/Dismiss or Disconnect. Right: chat.
+    fn host_window(&mut self, ctx: &egui::Context) {
+        let (pending, session, sessions) = {
             let sh = self.net.shared.lock().unwrap();
-            sh.requests.first().map(|r| (r.id, r.name.clone(), r.peer.clone()))
-        };
-        let Some((id, name, peer)) = pending else { return };
-        // Reset the checkboxes (all allowed) when a new request appears.
-        if self.access_draft.map(|(i, _)| i) != Some(id) {
-            self.access_draft = Some((id, crate::proto::Permissions::all()));
-        }
-        let perms = &mut self.access_draft.as_mut().unwrap().1;
-        let mut answer: Option<Option<crate::proto::Permissions>> = None;
-        egui::Modal::new(egui::Id::unique("access")).frame(dialog_frame()).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(RichText::new("มีคนขอเข้าควบคุมเครื่องนี้").font(bold(18.0)));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                dot(ui, ACCENT_LIGHT, 10.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&name).font(bold(15.0)));
-                    ui.label(RichText::new(format!("ID {}…  ·  รหัสผ่านถูกต้องแล้ว", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
-                });
+            let pending = sh.requests.first().map(|r| (r.id, r.name.clone(), r.peer.clone()));
+            let session = sh.incoming.first().map(|i| {
+                (i.name.clone(), i.conn.clone(), i.chat.iter().map(|m| (m.from_me, m.text.clone())).collect::<Vec<_>>())
             });
-            ui.add_space(12.0);
-            ui.label(RichText::new("อนุญาตให้ทำสิ่งเหล่านี้").color(MUTED).size(13.0));
-            ui.add_space(4.0);
-            ui.checkbox(&mut perms.control, "ควบคุมเมาส์และคีย์บอร์ด (ถ้าไม่ติ๊ก = ดูจออย่างเดียว)");
-            ui.checkbox(&mut perms.clipboard, "ใช้คลิปบอร์ดร่วมกัน");
-            ui.checkbox(&mut perms.files, "ส่ง/รับไฟล์");
-            ui.add_space(14.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if accent_button(ui, "อนุญาต").clicked() {
-                    answer = Some(Some(*perms));
-                }
-                if danger_button(ui, "ปฏิเสธ").clicked() {
-                    answer = Some(None);
+            (pending, session, sh.incoming.len())
+        };
+        if pending.is_none() && session.is_none() {
+            self.access_draft = None;
+            self.host_seen = (0, 0, 0);
+            return;
+        }
+        let seen = (
+            pending.as_ref().map_or(0, |p| p.0),
+            sessions,
+            session.as_ref().map_or(0, |s| s.2.iter().filter(|m| !m.0).count()),
+        );
+        let id = egui::ViewportId::from_hash_of("host_session");
+        if seen != self.host_seen {
+            self.host_seen = seen;
+            self.host_win_hidden = false;
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+        }
+        if self.host_win_hidden {
+            return;
+        }
+        if let Some((req_id, ..)) = &pending {
+            if self.access_draft.map(|(i, _)| i) != Some(*req_id) {
+                self.access_draft = Some((*req_id, crate::proto::Permissions::all()));
+            }
+        }
+        let name = pending.as_ref().map(|p| p.1.clone()).or_else(|| session.as_ref().map(|s| s.0.clone())).unwrap_or_default();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("RemoteDesk - {name}"))
+            .with_inner_size([660.0, 430.0])
+            .with_min_inner_size([520.0, 360.0])
+            .with_always_on_top()
+            .with_icon(std::sync::Arc::new(crate::icon()));
+        let mut answer: Option<Option<crate::proto::Permissions>> = None;
+        let mut send: Option<String> = None;
+        let mut closed = false;
+        let draft = &mut self.access_draft;
+        let input = &mut self.host_chat_input;
+        ctx.show_viewport_immediate(id, builder, |ui, _| {
+            if ui.input(|i| i.viewport().close_requested()) {
+                closed = true;
+            }
+            egui::Panel::left("host_left")
+                .exact_size(250.0)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(SURFACE).inner_margin(18))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+                        ui.painter().rect_filled(r, 12.0, ACCENT);
+                        let initial = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, initial, bold(30.0), Color32::WHITE);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&name).font(bold(15.0)));
+                            let what = if pending.is_some() { "ขอควบคุมเครื่องนี้" } else { "กำลังควบคุมเครื่องนี้" };
+                            ui.label(RichText::new(what).color(MUTED).size(12.5));
+                        });
+                    });
+                    if let Some((_, _, peer)) = &pending {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("ID {}…", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
+                    }
+                    ui.add_space(16.0);
+                    if let (Some(_), Some((_, perms))) = (&pending, draft.as_mut()) {
+                        ui.label(RichText::new("อนุญาตให้").color(MUTED).size(13.0));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            perm_toggle(ui, &mut perms.control, PermIcon::Control, "ควบคุมเมาส์และคีย์บอร์ด (ปิด = ดูจออย่างเดียว)");
+                            perm_toggle(ui, &mut perms.clipboard, PermIcon::Clipboard, "ใช้คลิปบอร์ดร่วมกัน");
+                            perm_toggle(ui, &mut perms.files, PermIcon::Files, "ส่ง/รับไฟล์");
+                        });
+                    }
+                    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                        let full = vec2(ui.available_width(), 38.0);
+                        let big = |text: &str, fill: Color32| {
+                            egui::Button::new(RichText::new(text).font(bold(14.0)).color(Color32::WHITE))
+                                .fill(fill)
+                                .stroke(Stroke::NONE)
+                                .min_size(full)
+                        };
+                        if pending.is_some() {
+                            if ui.add(big("ปฏิเสธ", DANGER)).clicked() {
+                                answer = Some(None);
+                            }
+                            ui.add_space(6.0);
+                            if ui.add(big("ยอมรับ", GREEN)).clicked() {
+                                answer = Some(draft.map(|(_, p)| p));
+                            }
+                        } else if let Some((_, conn, _)) = &session {
+                            if ui.add(big("ตัดการเชื่อมต่อ", DANGER)).clicked() {
+                                conn.close(0u32.into(), b"kicked");
+                            }
+                        }
+                    });
+                });
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG).inner_margin(10)).show(ui, |ui| {
+                ui.label(RichText::new("แชท").font(bold(15.0)));
+                ui.add_space(6.0);
+                match &session {
+                    Some((_, _, msgs)) if pending.is_none() => send = chat_body(ui, msgs, input),
+                    _ => {
+                        ui.label(RichText::new("แชทได้หลังจากกดยอมรับ").color(MUTED).size(13.0));
+                    }
                 }
             });
         });
-        if let Some(result) = answer {
+        if closed {
+            // Closing while asked counts as "no"; otherwise just hide until something new happens.
+            if pending.is_some() {
+                answer = Some(None);
+            }
+            self.host_win_hidden = true;
+        }
+        if let (Some(result), Some((req_id, ..))) = (answer, &pending) {
             let mut sh = self.net.shared.lock().unwrap();
-            if let Some(req) = sh.requests.iter_mut().find(|r| r.id == id) {
+            if let Some(req) = sh.requests.iter_mut().find(|r| r.id == *req_id) {
                 req.answer(result);
             }
-            self.access_draft = None;
+        }
+        if let Some(text) = send {
+            if let Some(inc) = self.net.shared.lock().unwrap().incoming.first_mut() {
+                inc.send_chat(text);
+            }
         }
     }
 
@@ -1502,6 +1597,73 @@ fn sync_mods(viewer: &Viewer, sent: &mut egui::Modifiers, now: egui::Modifiers) 
     sent.ctrl = now.ctrl;
     sent.shift = now.shift;
     sent.alt = now.alt;
+}
+
+#[derive(Clone, Copy)]
+enum PermIcon {
+    Control,
+    Clipboard,
+    Files,
+}
+
+/// A square on/off button with a drawn icon, like AnyDesk's permission buttons.
+fn perm_toggle(ui: &mut egui::Ui, on: &mut bool, icon: PermIcon, tip: &str) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(44.0, 38.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let fill = match (*on, resp.hovered()) {
+        (true, false) => ACCENT,
+        (true, true) => ACCENT_LIGHT,
+        (false, false) => SURFACE2,
+        (false, true) => BORDER,
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 6.0, fill);
+    let fg = if *on { Color32::WHITE } else { MUTED };
+    let st = Stroke::new(1.6, fg);
+    let c = rect.center();
+    match icon {
+        PermIcon::Control => {
+            // A mouse: rounded body with a button split.
+            let body = Rect::from_center_size(c, vec2(12.0, 18.0));
+            p.rect_stroke(body, 6.0, st, egui::StrokeKind::Middle);
+            p.line_segment([pos2(c.x, body.top()), pos2(c.x, body.top() + 6.0)], st);
+        }
+        PermIcon::Clipboard => {
+            let board = Rect::from_center_size(c + vec2(0.0, 1.5), vec2(14.0, 17.0));
+            p.rect_stroke(board, 2.0, st, egui::StrokeKind::Middle);
+            p.rect_filled(Rect::from_center_size(pos2(c.x, board.top()), vec2(7.0, 4.0)), 1.0, fg);
+            for dy in [0.0, 4.0] {
+                p.line_segment([pos2(board.left() + 3.5, c.y + dy), pos2(board.right() - 3.5, c.y + dy)], st);
+            }
+        }
+        PermIcon::Files => {
+            // A page with a folded corner and an arrow.
+            let (l, t, r, b) = (c.x - 7.0, c.y - 9.0, c.x + 7.0, c.y + 9.0);
+            let pts = vec![pos2(l, t), pos2(r - 4.5, t), pos2(r, t + 4.5), pos2(r, b), pos2(l, b)];
+            p.add(egui::Shape::closed_line(pts, st));
+            p.line_segment([pos2(c.x - 3.5, c.y + 2.0), pos2(c.x + 3.5, c.y + 2.0)], st);
+            p.line_segment([pos2(c.x + 0.5, c.y - 1.0), pos2(c.x + 3.5, c.y + 2.0)], st);
+            p.line_segment([pos2(c.x + 0.5, c.y + 5.0), pos2(c.x + 3.5, c.y + 2.0)], st);
+        }
+    }
+    if !*on {
+        // Diagonal strike so "off" is obvious at a glance, not just by color.
+        p.line_segment([rect.left_bottom() + vec2(10.0, -8.0), rect.right_top() + vec2(-10.0, 8.0)], Stroke::new(1.6, DANGER_TEXT));
+    }
+    let state = if *on { "อนุญาต" } else { "ไม่อนุญาต" };
+    resp.on_hover_text(format!("{tip}: {state}"));
+}
+
+/// An arrow pointer with its tip at `tip`.
+fn purple_cursor(painter: &egui::Painter, tip: egui::Pos2) {
+    let pts: Vec<egui::Pos2> = [(0.0, 0.0), (0.0, 17.0), (4.5, 13.0), (7.5, 19.5), (10.5, 18.0), (7.5, 11.8), (13.0, 11.8)]
+        .iter()
+        .map(|&(x, y)| tip + vec2(x, y))
+        .collect();
+    painter.add(egui::Shape::convex_polygon(pts.clone(), ACCENT_LIGHT, Stroke::NONE));
+    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2, Color32::WHITE)));
 }
 
 fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
