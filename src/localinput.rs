@@ -176,6 +176,58 @@ fn shell_execute(verb: &str, exe: &std::path::Path) -> bool {
     r as isize > 32
 }
 
+/// Whether the window under the mouse belongs to a program running as administrator.
+pub fn elevated_at_cursor() -> bool {
+    let (x, y) = cursor_pos();
+    let hwnd = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint(windows_sys::Win32::Foundation::POINT { x, y }) };
+    window_elevated(hwnd)
+}
+
+/// Whether the focused window belongs to a program running as administrator.
+pub fn elevated_foreground() -> bool {
+    window_elevated(unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() })
+}
+
+fn window_elevated(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if hwnd.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    // Our own windows run elevated but are not something to protect.
+    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return true; // can't even look at it: a protected/system process
+        }
+        let mut token = std::ptr::null_mut();
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        let ok = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0
+            && GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut elevation as *mut _ as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            ) != 0;
+        if !token.is_null() {
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+        !ok || elevation.TokenIsElevated != 0
+    }
+}
+
 /// The mouse position in screen coordinates.
 pub fn cursor_pos() -> (i32, i32) {
     let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };

@@ -69,6 +69,8 @@ struct Session {
     chat_input: String,
     /// Chat messages already seen, so a new one from the other side opens the chat window.
     chat_seen: usize,
+    /// Keys we pressed on the remote and have not released yet.
+    held_keys: Vec<u16>,
 }
 
 #[derive(Default)]
@@ -113,8 +115,6 @@ pub struct App {
     gradients: HashMap<String, TextureHandle>,
     logo: TextureHandle,
     updater: Updater,
-    /// True once the tray icon is running, so closing the window hides to tray instead of exiting.
-    close_to_tray: bool,
     /// Whether the local keyboard is currently being sent to the remote.
     capturing_keys: bool,
     #[cfg(debug_assertions)]
@@ -129,11 +129,9 @@ impl App {
         let net = Net::start(crate::config::Config::load(), cc.egui_ctx.clone())?;
         // Keep the Windows Run entry in sync with the saved setting.
         crate::autostart::set_enabled(net.shared.lock().unwrap().cfg.start_with_windows);
-        crate::tray::start(cc.egui_ctx.clone());
         crate::singleinstance::start_show_listener(cc.egui_ctx.clone());
         let updater = Updater::start(net.runtime(), cc.egui_ctx.clone());
         Ok(App {
-            close_to_tray: true,
             capturing_keys: false,
             updater,
             net,
@@ -180,7 +178,6 @@ impl App {
         *updater.state.lock().unwrap() =
             UpdateState::Available { version: "1.1.0".into(), notes: "ตัวอย่าง".into() };
         let mut app = App {
-            close_to_tray: false,
             capturing_keys: false,
             updater,
             net,
@@ -272,6 +269,7 @@ impl App {
             chat_open: false,
             chat_input: String::new(),
             chat_seen: 0,
+            held_keys: Vec::new(),
         });
     }
 
@@ -929,7 +927,10 @@ impl App {
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(s) = &mut self.session else { return };
-        let (remote_busy, view_only) = { let v = s.viewer.lock().unwrap(); (v.remote_busy, !v.perms.control) };
+        let (remote_busy, view_only, no_admin) = {
+            let v = s.viewer.lock().unwrap();
+            (v.remote_busy, !v.perms.control, !v.perms.admin)
+        };
         let (status, peer_id, peer_short, name, direct, frames, bytes, patches) = {
             let mut v = s.viewer.lock().unwrap();
             (
@@ -1035,9 +1036,11 @@ impl App {
                     }
                     if remote_busy {
                         pill(ui, AMBER, "ปลายทางกำลังใช้เมาส์/คีย์บอร์ดเอง");
+                    }
                     if view_only {
                         pill(ui, AMBER, "โหมดดูอย่างเดียว");
-                    }
+                    } else if no_admin {
+                        pill(ui, AMBER, "สิทธิ์ปกติ: กดโปรแกรมแอดมินไม่ได้");
                     }
                     if wide {
                         ui.label(RichText::new(format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)).color(MUTED).size(13.0));
@@ -1127,6 +1130,10 @@ impl App {
                         sync_mods(&viewer, &mut s.sent_mods, modifiers);
                         if let Some(vk) = vk_for(physical_key.unwrap_or(key)) {
                             viewer.send(Input::KeyVk { vk, down: pressed });
+                            s.held_keys.retain(|&k| k != vk);
+                            if pressed {
+                                s.held_keys.push(vk);
+                            }
                         }
                     }
                     // egui turns Ctrl+C/X/V into these instead of key events; the Ctrl is already
@@ -1147,6 +1154,14 @@ impl App {
             }
             // Final reconcile: release any modifier whose key was let go without an event.
             sync_mods(&viewer, &mut s.sent_mods, cur_mods);
+            // Losing focus (Alt+Tab, a click elsewhere) means we never see the key-up events, so
+            // release everything we hold or it stays pressed on the remote.
+            if !ui.input(|i| i.viewport().focused.unwrap_or(true)) {
+                sync_mods(&viewer, &mut s.sent_mods, egui::Modifiers::default());
+                for vk in s.held_keys.drain(..) {
+                    viewer.send(Input::KeyVk { vk, down: false });
+                }
+            }
         });
 
         // Chat window (controller side). A new message from the other side opens it.
@@ -1257,11 +1272,6 @@ impl eframe::App for App {
             });
             return;
         }
-        // Closing the window hides to the tray; quit from the tray menu to exit.
-        if self.close_to_tray && ui.ctx().input(|i| i.viewport().close_requested()) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
         if self.session.is_some() {
             self.session_ui(ui);
         } else {
@@ -1277,8 +1287,7 @@ impl App {
     /// Grabs the whole keyboard (Win, Alt+Tab, ...) while a connected session window is focused
     /// and no dialog is open; releases it the moment that stops being true.
     /// The AnyDesk-style window on the controlled machine: its own OS window, on top of everything,
-    /// that pops up when someone asks to connect or is connected (even while the app is in the
-    /// tray). Left: who it is, permissions, Accept/Dismiss or Disconnect. Right: chat.
+    /// that pops up when someone asks to connect or is connected. Left: who it is, permissions, Accept/Dismiss or Disconnect. Right: chat.
     fn host_window(&mut self, ctx: &egui::Context) {
         let (pending, session, sessions) = {
             let sh = self.net.shared.lock().unwrap();
@@ -1367,12 +1376,22 @@ impl App {
                                 .min_size(full)
                         };
                         if pending.is_some() {
-                            if ui.add(big("ปฏิเสธ", DANGER)).clicked() {
-                                answer = Some(None);
-                            }
+                            // Bottom row: normal accept + dismiss; above it, accept as administrator.
+                            let half = vec2((full.x - 6.0) / 2.0, 38.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if ui.add(big("ยอมรับ", GREEN).min_size(half)).on_hover_text("ควบคุมได้ แต่กดโปรแกรมที่รันแบบแอดมิน (เช่น Task Manager) ไม่ได้").clicked() {
+                                    answer = Some(draft.map(|(_, p)| crate::proto::Permissions { admin: false, ..p }));
+                                }
+                                if ui.add(big("ปฏิเสธ", DANGER).min_size(half)).clicked() {
+                                    answer = Some(None);
+                                }
+                            });
                             ui.add_space(6.0);
-                            if ui.add(big("ยอมรับ", GREEN)).clicked() {
-                                answer = Some(draft.map(|(_, p)| p));
+                            let r = ui.add(big("      ยอมรับแบบผู้ดูแลระบบ", GREEN)).on_hover_text("ควบคุมได้ทุกโปรแกรม รวมถึงโปรแกรมที่รันแบบแอดมิน");
+                            shield_icon(ui.painter(), r.rect.left_center() + vec2(22.0, 0.0));
+                            if r.clicked() {
+                                answer = Some(draft.map(|(_, p)| crate::proto::Permissions { admin: true, ..p }));
                             }
                         } else if let Some((_, conn, _)) = &session {
                             if ui.add(big("ตัดการเชื่อมต่อ", DANGER)).clicked() {
@@ -1656,6 +1675,15 @@ fn perm_toggle(ui: &mut egui::Ui, on: &mut bool, icon: PermIcon, tip: &str) {
     resp.on_hover_text(format!("{tip}: {state}"));
 }
 
+/// A small white shield centered at `c`.
+fn shield_icon(painter: &egui::Painter, c: egui::Pos2) {
+    let pts: Vec<egui::Pos2> = [(-6.0, -7.0), (6.0, -7.0), (6.0, 0.0), (0.0, 7.5), (-6.0, 0.0)]
+        .iter()
+        .map(|&(x, y)| c + vec2(x, y))
+        .collect();
+    painter.add(egui::Shape::convex_polygon(pts, Color32::WHITE, Stroke::NONE));
+}
+
 /// An arrow pointer with its tip at `tip`.
 fn purple_cursor(painter: &egui::Painter, tip: egui::Pos2) {
     let pts: Vec<egui::Pos2> = [(0.0, 0.0), (0.0, 17.0), (4.5, 13.0), (7.5, 19.5), (10.5, 18.0), (7.5, 11.8), (13.0, 11.8)]
@@ -1830,6 +1858,9 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.active.weak_bg_fill = Color32::from_rgb(64, 64, 72);
     v.widgets.active.bg_fill = Color32::from_rgb(64, 64, 72);
     v.text_edit_bg_color = Some(Color32::from_rgb(18, 18, 21));
+    // Always dark: following the Windows theme would give light-mode machines white widgets
+    // on our dark panels.
+    ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(v);
 
     ctx.global_style_mut(|s| {

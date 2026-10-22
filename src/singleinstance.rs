@@ -1,5 +1,5 @@
 //! Single instance: launching RemoteDesk again brings the existing window back instead of
-//! starting a second copy (which would add a second tray icon). Uses a named event — the first
+//! starting a second copy. Uses a named event — the first
 //! instance owns it; later launches signal it and exit.
 
 use std::sync::OnceLock;

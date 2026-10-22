@@ -22,7 +22,8 @@ const VK_CONTROL: u16 = 0x11;
 const VK_MENU: u16 = 0x12;
 
 pub enum Cmd {
-    Input(Geometry, Input),
+    /// The bool is whether the controller may reach programs running as administrator.
+    Input(Geometry, bool, Input),
     /// Release every held key/button (session ended).
     Reset,
 }
@@ -125,7 +126,7 @@ fn run(rx: Receiver<Cmd>) {
     for cmd in rx {
         // The local user wins: drop remote moves and presses while they are active. Releases
         // still go through so nothing stays held down.
-        if let Cmd::Input(_, ev) = &cmd {
+        if let Cmd::Input(_, admin, ev) = &cmd {
             let press = matches!(
                 ev,
                 Input::MouseMove { .. }
@@ -144,12 +145,21 @@ fn run(rx: Receiver<Cmd>) {
                 }
                 continue;
             }
+            // Without admin rights, presses aimed at an elevated program are dropped: clicks and
+            // scrolls by the window under the cursor, keys by the focused window.
+            if !*admin {
+                let mouse = matches!(ev, Input::Scroll { .. } | Input::Button { down: true, .. });
+                let key = press && !mouse && !matches!(ev, Input::MouseMove { .. });
+                if (mouse && crate::localinput::elevated_at_cursor()) || (key && crate::localinput::elevated_foreground()) {
+                    continue;
+                }
+            }
             if received % 500 == 1 {
                 log(&format!("inputs received={received} paused={paused} failed={failed}"));
             }
         }
         match cmd {
-            Cmd::Input(g, Input::MouseMove { x, y }) => {
+            Cmd::Input(g, _, Input::MouseMove { x, y }) => {
                 let px = g.x + (x.clamp(0.0, 1.0) * (g.w.saturating_sub(1)) as f32).round() as i32;
                 let py = g.y + (y.clamp(0.0, 1.0) * (g.h.saturating_sub(1)) as f32).round() as i32;
                 if !mouse_to(px, py) {
@@ -159,7 +169,7 @@ fn run(rx: Receiver<Cmd>) {
                     }
                 }
             }
-            Cmd::Input(_, Input::Button { button, down }) => {
+            Cmd::Input(_, _, Input::Button { button, down }) => {
                 if !send_mouse(button_flags(button, down), 0, 0, 0) {
                     failed += 1;
                     log(&format!("SendInput(button) failed, error {}", std::io::Error::last_os_error()));
@@ -169,7 +179,7 @@ fn run(rx: Receiver<Cmd>) {
                     held_buttons.push(button);
                 }
             }
-            Cmd::Input(_, Input::Scroll { dx, dy }) => {
+            Cmd::Input(_, _, Input::Scroll { dx, dy }) => {
                 // Our dy is positive for "scroll down"; Windows wheel delta is positive for up.
                 if dy != 0 {
                     send_mouse(MOUSEEVENTF_WHEEL, 0, 0, -dy * 120);
@@ -178,7 +188,7 @@ fn run(rx: Receiver<Cmd>) {
                     send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, dx * 120);
                 }
             }
-            Cmd::Input(_, Input::Key { vk, down, ctrl, shift, alt }) => {
+            Cmd::Input(_, _, Input::Key { vk, down, ctrl, shift, alt }) => {
                 set_mod(&mut enigo, &mut mods[0], VK_CONTROL, ctrl);
                 set_mod(&mut enigo, &mut mods[1], VK_SHIFT, shift);
                 set_mod(&mut enigo, &mut mods[2], VK_MENU, alt);
@@ -190,7 +200,7 @@ fn run(rx: Receiver<Cmd>) {
                     held_keys.push(vk);
                 }
             }
-            Cmd::Input(_, Input::Text(text)) => {
+            Cmd::Input(_, _, Input::Text(text)) => {
                 set_mod(&mut enigo, &mut mods[0], VK_CONTROL, false);
                 set_mod(&mut enigo, &mut mods[1], VK_SHIFT, false);
                 set_mod(&mut enigo, &mut mods[2], VK_MENU, false);
@@ -198,8 +208,8 @@ fn run(rx: Receiver<Cmd>) {
                     let _ = e.text(&text);
                 }
             }
-            Cmd::Input(_, Input::Clipboard(_)) | Cmd::Input(_, Input::Chat(_)) => {}
-            Cmd::Input(_, Input::KeyVk { vk, down }) => {
+            Cmd::Input(_, _, Input::Clipboard(_)) | Cmd::Input(_, _, Input::Chat(_)) => {}
+            Cmd::Input(_, _, Input::KeyVk { vk, down }) => {
                 // Extended keys (arrows, Ins/Del/Home/End, right-side modifiers, numpad /, Win)
                 // must carry the extended flag for Windows to recognise them.
                 let extended = matches!(
@@ -215,7 +225,7 @@ fn run(rx: Receiver<Cmd>) {
                     held_raw.push((vk, 0, extended));
                 }
             }
-            Cmd::Input(_, Input::RawKey { vk, scan, extended, down }) => {
+            Cmd::Input(_, _, Input::RawKey { vk, scan, extended, down }) => {
                 if !send_key(vk, scan, extended, down) {
                     failed += 1;
                     log(&format!("SendInput(key) failed, error {}", std::io::Error::last_os_error()));

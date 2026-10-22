@@ -60,11 +60,19 @@ pub struct Permissions {
     pub control: bool,
     pub clipboard: bool,
     pub files: bool,
+    /// May also control programs running as administrator (Task Manager, installers, ...).
+    /// "Accept" grants control without this; "Accept as administrator" grants it.
+    #[serde(default = "yes")]
+    pub admin: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Permissions {
     pub fn all() -> Permissions {
-        Permissions { control: true, clipboard: true, files: true }
+        Permissions { control: true, clipboard: true, files: true, admin: true }
     }
 }
 

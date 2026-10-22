@@ -750,7 +750,7 @@ async fn serve_control(
                 continue;
             }
             let g: Geometry = *geometry.lock().unwrap();
-            input.send(Cmd::Input(g, event)).ok();
+            input.send(Cmd::Input(g, perms.admin, event)).ok();
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())

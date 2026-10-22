@@ -10,7 +10,6 @@ mod proto;
 mod shortid;
 mod singleinstance;
 mod transfer;
-mod tray;
 mod autostart;
 mod security;
 mod updater;
@@ -131,7 +130,7 @@ fn main() -> eframe::Result {
         }
     }
     // If RemoteDesk is already running, tell it to show its window and exit instead of adding
-    // a second instance (and a second tray icon).
+    // a second instance.
     if !singleinstance::acquire() {
         return Ok(());
     }
@@ -318,7 +317,7 @@ fn selftest(log_path: &str) {
     let vo = ctl.connect(shortid::format(&short), password.clone());
     wait(&|| !host.shared.lock().unwrap().requests.is_empty(), 30);
     if let Some(req) = host.shared.lock().unwrap().requests.first_mut() {
-        req.answer(Some(proto::Permissions { control: false, clipboard: true, files: false }));
+        req.answer(Some(proto::Permissions { control: false, clipboard: true, files: false, admin: false }));
     }
     wait(&|| vo.lock().unwrap().status == net::ViewStatus::Connected, 30);
     let p = vo.lock().unwrap().perms;
