@@ -99,6 +99,22 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) ->
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
+/// Whether the window in front belongs to this process. Checked on every key so a stale "focused"
+/// flag (the UI only updates when it repaints) can never grab Alt+Tab from another program.
+fn foreground_is_ours() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, IsIconic};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() || IsIconic(hwnd) != 0 {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
         let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
@@ -113,7 +129,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize)
                 || WIN_HELD.load(Ordering::Relaxed)
                 || ((vk == VK_TAB || vk == VK_ESCAPE) && info.flags & LLKHF_ALTDOWN != 0)
                 || (vk == VK_ESCAPE && unsafe { GetAsyncKeyState(VK_CONTROL as i32) } < 0);
-            if system_key && CAPTURE.load(Ordering::Relaxed) {
+            if system_key && CAPTURE.load(Ordering::Relaxed) && foreground_is_ours() {
                 // Keep this path minimal: just forward the key and swallow it. Doing real work
                 // (locks, channel to the network) here can exceed Windows' hook timeout, which
                 // silently drops the hook so the shortcut leaks to the local machine instead.

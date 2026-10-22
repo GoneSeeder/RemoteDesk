@@ -42,6 +42,8 @@ pub struct Incoming {
     pub chat: Vec<ChatMsg>,
     /// Sends a chat line from this machine to the controller.
     chat_tx: mpsc::UnboundedSender<String>,
+    /// What the controller may do; changeable during the session from the host window.
+    perms_tx: tokio::sync::watch::Sender<Permissions>,
 }
 
 impl Incoming {
@@ -50,6 +52,15 @@ impl Incoming {
         if self.chat_tx.send(text.clone()).is_ok() {
             self.chat.push(ChatMsg { from_me: true, text });
         }
+    }
+
+    pub fn perms(&self) -> Permissions {
+        *self.perms_tx.borrow()
+    }
+
+    /// Takes effect immediately and is reported to the controller.
+    pub fn set_perms(&self, perms: Permissions) {
+        self.perms_tx.send_replace(perms);
     }
 }
 
@@ -348,6 +359,10 @@ async fn run_viewer(
                             v.lock().unwrap().chat.push(ChatMsg { from_me: false, text });
                             ctx.request_repaint();
                         }
+                        HostMsg::Perms(p) => {
+                            v.lock().unwrap().perms = p;
+                            ctx.request_repaint();
+                        }
                         HostMsg::Cursor { x, y } => {
                             v.lock().unwrap().host_cursor = Some((x, y, std::time::Instant::now()));
                             ctx.request_repaint();
@@ -635,12 +650,14 @@ async fn serve_control(
     write_json(&mut send, &Welcome { ok: true, msg: String::new(), name: my_name, short, perms }).await?;
 
     let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<String>();
+    let (perms_tx, perms) = tokio::sync::watch::channel(perms);
     shared.lock().unwrap().incoming.push(Incoming {
         session,
         name: hello.name,
         conn: conn.clone(),
         chat: Vec::new(),
         chat_tx,
+        perms_tx,
     });
     ctx.request_repaint();
 
@@ -666,6 +683,7 @@ async fn serve_control(
     };
     let peer_name = shared.lock().unwrap().incoming.iter().find(|i| i.session == session).map(|i| i.name.clone()).unwrap_or_default();
     let (clip_id, mut clip_rx) = clipboard.subscribe();
+    let mut perm_changes = perms.clone();
     let clip_out = async {
         let mut busy = false;
         let mut last_cursor = (i32::MIN, i32::MIN);
@@ -674,16 +692,20 @@ async fn serve_control(
             tokio::select! {
                 item = clip_rx.recv() => {
                     let Some(item) = item else { break };
-                    if !perms.clipboard {
+                    if !perms.borrow().clipboard {
                         continue;
                     }
                     match item {
                         transfer::ClipItem::Text(text) => write_json(&mut events, &HostMsg::Clipboard(text)).await?,
-                        transfer::ClipItem::Files(paths) if perms.files => {
+                        transfer::ClipItem::Files(paths) if perms.borrow().files => {
                             let _ = transfer::send_clip_bundle(conn.clone(), paths).await;
                         }
                         transfer::ClipItem::Files(_) => {}
                     }
+                }
+                Ok(()) = perm_changes.changed() => {
+                    let p = *perm_changes.borrow_and_update();
+                    write_json(&mut events, &HostMsg::Perms(p)).await?;
                 }
                 chat = chat_rx.recv() => {
                     match chat {
@@ -713,7 +735,7 @@ async fn serve_control(
     };
     let files = async {
         while let Ok(recv) = conn.accept_uni().await {
-            if !perms.files {
+            if !perms.borrow().files {
                 continue; // file transfer not permitted; drop the stream
             }
             let (peer_name, transfers, clipboard, ctx) =
@@ -728,10 +750,11 @@ async fn serve_control(
         anyhow::Ok(())
     };
     let inputs = async {
+        let mut had_control = false;
         loop {
             let event: Input = read_json(&mut recv).await?;
             if let Input::Clipboard(text) = event {
-                if perms.clipboard {
+                if perms.borrow().clipboard {
                     clipboard.set(text);
                 }
                 continue;
@@ -746,11 +769,18 @@ async fn serve_control(
                 continue;
             }
             // When control is not granted the session is view-only: ignore mouse/keyboard.
-            if !perms.control {
+            let p = *perms.borrow();
+            if !p.control {
+                // Control was just taken away: let go of anything the controller was holding.
+                if had_control {
+                    input.send(Cmd::Reset).ok();
+                    had_control = false;
+                }
                 continue;
             }
+            had_control = true;
             let g: Geometry = *geometry.lock().unwrap();
-            input.send(Cmd::Input(g, perms.admin, event)).ok();
+            input.send(Cmd::Input(g, p.admin, event)).ok();
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())

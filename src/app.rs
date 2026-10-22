@@ -1293,7 +1293,7 @@ impl App {
             let sh = self.net.shared.lock().unwrap();
             let pending = sh.requests.first().map(|r| (r.id, r.name.clone(), r.peer.clone()));
             let session = sh.incoming.first().map(|i| {
-                (i.name.clone(), i.conn.clone(), i.chat.iter().map(|m| (m.from_me, m.text.clone())).collect::<Vec<_>>())
+                (i.name.clone(), i.conn.clone(), i.chat.iter().map(|m| (m.from_me, m.text.clone())).collect::<Vec<_>>(), i.perms())
             });
             (pending, session, sh.incoming.len())
         };
@@ -1331,6 +1331,7 @@ impl App {
         let mut answer: Option<Option<crate::proto::Permissions>> = None;
         let mut send: Option<String> = None;
         let mut closed = false;
+        let mut live = session.as_ref().map(|s| s.3);
         let draft = &mut self.access_draft;
         let input = &mut self.host_chat_input;
         ctx.show_viewport_immediate(id, builder, |ui, _| {
@@ -1358,13 +1359,19 @@ impl App {
                         ui.label(RichText::new(format!("ID {}…", &peer[..peer.len().min(12)])).color(MUTED).size(12.0));
                     }
                     ui.add_space(16.0);
-                    if let (Some(_), Some((_, perms))) = (&pending, draft.as_mut()) {
+                    // While asking: edit the draft (admin is chosen by which Accept is pressed).
+                    // During the session: change the live permissions, including admin.
+                    let editing = if pending.is_some() { draft.as_mut().map(|(_, p)| (p, false)) } else { live.as_mut().map(|p| (p, true)) };
+                    if let Some((perms, with_admin)) = editing {
                         ui.label(RichText::new("อนุญาตให้").color(MUTED).size(13.0));
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             perm_toggle(ui, &mut perms.control, PermIcon::Control, "ควบคุมเมาส์และคีย์บอร์ด (ปิด = ดูจออย่างเดียว)");
                             perm_toggle(ui, &mut perms.clipboard, PermIcon::Clipboard, "ใช้คลิปบอร์ดร่วมกัน");
                             perm_toggle(ui, &mut perms.files, PermIcon::Files, "ส่ง/รับไฟล์");
+                            if with_admin {
+                                perm_toggle(ui, &mut perms.admin, PermIcon::Admin, "ควบคุมโปรแกรมที่รันแบบแอดมิน เช่น Task Manager");
+                            }
                         });
                     }
                     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -1393,7 +1400,7 @@ impl App {
                             if r.clicked() {
                                 answer = Some(draft.map(|(_, p)| crate::proto::Permissions { admin: true, ..p }));
                             }
-                        } else if let Some((_, conn, _)) = &session {
+                        } else if let Some((_, conn, ..)) = &session {
                             if ui.add(big("ตัดการเชื่อมต่อ", DANGER)).clicked() {
                                 conn.close(0u32.into(), b"kicked");
                             }
@@ -1404,7 +1411,7 @@ impl App {
                 ui.label(RichText::new("แชท").font(bold(15.0)));
                 ui.add_space(6.0);
                 match &session {
-                    Some((_, _, msgs)) if pending.is_none() => send = chat_body(ui, msgs, input),
+                    Some((_, _, msgs, _)) if pending.is_none() => send = chat_body(ui, msgs, input),
                     _ => {
                         ui.label(RichText::new("แชทได้หลังจากกดยอมรับ").color(MUTED).size(13.0));
                     }
@@ -1427,6 +1434,13 @@ impl App {
         if let Some(text) = send {
             if let Some(inc) = self.net.shared.lock().unwrap().incoming.first_mut() {
                 inc.send_chat(text);
+            }
+        }
+        if let (Some(p), Some((.., before))) = (live, &session) {
+            if (p.control, p.clipboard, p.files, p.admin) != (before.control, before.clipboard, before.files, before.admin) {
+                if let Some(inc) = self.net.shared.lock().unwrap().incoming.first() {
+                    inc.set_perms(p);
+                }
             }
         }
     }
@@ -1623,6 +1637,7 @@ enum PermIcon {
     Control,
     Clipboard,
     Files,
+    Admin,
 }
 
 /// A square on/off button with a drawn icon, like AnyDesk's permission buttons.
@@ -1643,6 +1658,13 @@ fn perm_toggle(ui: &mut egui::Ui, on: &mut bool, icon: PermIcon, tip: &str) {
     let st = Stroke::new(1.6, fg);
     let c = rect.center();
     match icon {
+        PermIcon::Admin => {
+            let pts: Vec<egui::Pos2> = [(-7.0, -8.0), (7.0, -8.0), (7.0, 0.0), (0.0, 8.5), (-7.0, 0.0)]
+                .iter()
+                .map(|&(x, y)| c + vec2(x, y))
+                .collect();
+            p.add(egui::Shape::closed_line(pts, st));
+        }
         PermIcon::Control => {
             // A mouse: rounded body with a button split.
             let body = Rect::from_center_size(c, vec2(12.0, 18.0));

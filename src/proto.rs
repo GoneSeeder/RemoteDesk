@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/4";
+pub const ALPN_CTL: &[u8] = b"remotedesk/ctl/5";
 pub const ALPN_PING: &[u8] = b"remotedesk/ping/1";
 
 pub const WRONG_PASSWORD: &str = "รหัสผ่านไม่ถูกต้อง";
@@ -116,6 +116,8 @@ pub enum HostMsg {
     Chat(String),
     /// The local user moved the mouse; position as a fraction of the shared screen.
     Cursor { x: f32, y: f32 },
+    /// The person at the controlled machine changed what the controller may do.
+    Perms(Permissions),
 }
 
 /// One H.264 access unit of the remote screen.

@@ -6,6 +6,7 @@ mod config;
 mod input;
 mod localinput;
 mod net;
+mod overlay;
 mod proto;
 mod shortid;
 mod singleinstance;
@@ -78,6 +79,15 @@ fn main() -> eframe::Result {
         std::process::exit(0);
     }
 
+    // Dev check: `remotedesk --pointer-test` shows the remote-pointer overlay at (200, 200) for 4s.
+    #[cfg(debug_assertions)]
+    if std::env::args().nth(1).as_deref() == Some("--pointer-test") {
+        for _ in 0..40 {
+            overlay::moved(200, 200);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        return Ok(());
+    }
     // Dev check: `remotedesk --clip-test` round-trips a file list through the clipboard.
     #[cfg(debug_assertions)]
     if std::env::args().nth(1).as_deref() == Some("--clip-test") {
@@ -264,6 +274,18 @@ fn selftest(log_path: &str) {
         let ctl_got_host = v.lock().unwrap().chat.iter().any(|m| !m.from_me && m.text == "hi from host");
         writeln!(log, "chat: controller has {ctl_chat} msgs, host has {host_chat} msgs, controller got host msg={ctl_got_host}").ok();
     }
+
+    // Permissions changed during the session reach the controller, then go back to full.
+    if let Some(inc) = host.shared.lock().unwrap().incoming.first() {
+        inc.set_perms(proto::Permissions { admin: false, ..proto::Permissions::all() });
+    }
+    wait(&|| !v.lock().unwrap().perms.admin, 10);
+    let live_change = !v.lock().unwrap().perms.admin;
+    if let Some(inc) = host.shared.lock().unwrap().incoming.first() {
+        inc.set_perms(proto::Permissions::all());
+    }
+    wait(&|| v.lock().unwrap().perms.admin, 10);
+    writeln!(log, "live permission change: admin off reached controller={live_change}, back on={}", v.lock().unwrap().perms.admin).ok();
 
     // File transfer both ways, compared byte for byte.
     let dir = std::env::temp_dir().join("remotedesk-selftest");

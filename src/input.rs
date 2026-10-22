@@ -181,6 +181,8 @@ fn run(rx: Receiver<Cmd>) {
                     if failed % 50 == 1 {
                         log(&format!("SendInput(move) failed, error {}", std::io::Error::last_os_error()));
                     }
+                } else {
+                    crate::overlay::moved(px, py);
                 }
             }
             Cmd::Input(_, _, Input::Button { button, down }) => {
@@ -240,6 +242,7 @@ fn run(rx: Receiver<Cmd>) {
                 }
             }
             Cmd::Reset => {
+                crate::overlay::hide();
                 for vk in held_keys.drain(..) {
                     send_vk(vk, false);
                 }
