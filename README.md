@@ -1,19 +1,19 @@
 # RemoteDesk
 
-โปรแกรมควบคุมหน้าจอระยะไกลสำหรับ Windows เชื่อมต่อแบบ P2P ผ่าน [iroh](https://github.com/n0-computer/iroh) จึงไม่ต้องมีเซิร์ฟเวอร์ของตัวเอง ใช้ไฟล์เดียวโดยไม่ต้องติดตั้ง
+Remote desktop for Windows. Machines connect peer-to-peer over [iroh](https://github.com/n0-computer/iroh), so no server of your own is needed. It ships as a single executable with no installer.
 
-## ความสามารถ
+## Features
 
-- ID 10 หลักผูกกับเครื่อง และแสดงสถานะออนไลน์ของเครื่องที่บันทึกไว้
-- ควบคุมเมาส์และคีย์บอร์ด รวมถึงปุ่ม Windows และ Alt+Tab
-- คัดลอกข้อความและไฟล์ข้ามเครื่อง และแชทระหว่างเซสชัน
-- เครื่องปลายทางกดรับและกำหนดสิทธิ์ได้ หรือเข้าด้วยรหัสผ่าน
-- บันทึกการเข้าถึง และล็อกชั่วคราวเมื่อใส่รหัสผ่านผิดหลายครั้ง
-- อัปเดตอัตโนมัติพร้อมตรวจลายเซ็น
+- Permanent 10-digit ID tied to the machine, with online status for saved contacts
+- Mouse and keyboard control, including the Windows key and Alt+Tab
+- Copy text and files between machines, and chat during a session
+- The remote side can accept a connection and choose permissions, or allow access by password
+- Access log and temporary lockout after repeated wrong passwords
+- Automatic updates with signature verification
 
-## การติดตั้ง
+## Installation
 
-ดาวน์โหลด `RemoteDesk.exe` จาก [Releases](https://github.com/GoneSeeder/RemoteDesk/releases/latest) โปรแกรมต้องใช้สิทธิ์ผู้ดูแลระบบ ไฟล์ยังไม่ได้เซ็นด้วยใบรับรอง Windows จึงอาจแสดงคำเตือน SmartScreen
+Download `RemoteDesk.exe` from [Releases](https://github.com/GoneSeeder/RemoteDesk/releases/latest). The program requires administrator rights. The executable is not code-signed yet, so Windows SmartScreen may show a warning.
 
 ## Build
 
@@ -21,8 +21,8 @@
 cargo build --release
 ```
 
-Push tag `vX.Y.Z` ที่ตรงกับ `version` ใน `Cargo.toml` เพื่อให้ GitHub Actions สร้าง Release (ต้องตั้ง secret `REMOTEDESK_SIGNING_KEY`)
+To publish a release, push a tag `vX.Y.Z` that matches `version` in `Cargo.toml`. GitHub Actions builds, signs and publishes it (requires the `REMOTEDESK_SIGNING_KEY` secret).
 
-## ข้อจำกัด
+## Limitations
 
-รองรับเฉพาะ Windows ส่ง Ctrl+Alt+Del ไม่ได้ ไม่มีระบบเสียง และไม่แนะนำให้ใช้กับเซิร์ฟเวอร์ที่สำคัญ
+Windows only. Ctrl+Alt+Del cannot be sent, there is no audio, and it is not recommended for critical servers.
