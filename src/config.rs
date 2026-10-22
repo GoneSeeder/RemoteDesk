@@ -40,7 +40,8 @@ pub struct Config {
     #[serde(default)]
     pub contacts: Vec<Contact>,
     /// Ask the person at this machine to allow each incoming session (in addition to the password).
-    #[serde(default)]
+    /// Stored under a new key so installs that saved the old default (off) start asking too.
+    #[serde(default = "yes", rename = "ask_before_connect")]
     pub ask_on_connect: bool,
     /// Start RemoteDesk automatically when Windows starts.
     #[serde(default)]
@@ -102,7 +103,7 @@ impl Config {
             short_id: String::new(),
             short_id_key: String::new(),
             contacts: Vec::new(),
-            ask_on_connect: false,
+            ask_on_connect: true,
             start_with_windows: false,
             key_override: None,
         }
@@ -134,4 +135,8 @@ impl Config {
         let bytes: [u8; 32] = Sha256::digest(format!("remotedesk-machine-key-v1:{}", seed.trim().to_lowercase())).into();
         iroh::SecretKey::from_bytes(&bytes)
     }
+}
+
+fn yes() -> bool {
+    true
 }
