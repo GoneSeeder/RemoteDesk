@@ -167,6 +167,7 @@ fn selftest(log_path: &str) {
     // Unattended (password) access on, so most checks below log in with the password.
     let mut host_cfg = config::Config::fresh();
     host_cfg.unattended = true;
+    host_cfg.password = "selftest-password".into();
     let password = host_cfg.password.clone();
     let host = net::Net::start(host_cfg, ctx.clone()).expect("start host");
     let host_id = host.shared.lock().unwrap().my_id.clone();

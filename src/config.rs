@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -47,9 +46,10 @@ pub struct Config {
     /// When someone connects without a password, whether to show the accept window.
     #[serde(default)]
     pub interactive: Interactive,
-    /// Unattended access: a correct password connects without anyone accepting. Off for new
-    /// installs; on for older ones (missing key), which always worked this way.
-    #[serde(default = "yes")]
+    /// Unattended access: a correct password connects without anyone accepting. Off until the
+    /// user sets a password in settings, like AnyDesk. (A new key: older versions turned it on
+    /// with a generated password the user never chose, so those start off again.)
+    #[serde(default, rename = "password_access")]
     pub unattended: bool,
     /// What a password (or automatic-login token) login may do.
     #[serde(default)]
@@ -128,13 +128,6 @@ pub fn random_token() -> String {
     (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect()
 }
 
-pub fn random_password() -> String {
-    // No 0/O/1/l/I to avoid confusion when read over the phone.
-    const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    let mut rng = rand::rng();
-    (0..8).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
-}
-
 /// Windows' per-installation GUID. It survives reinstalling this app and is the same for every
 /// user on the machine; only reinstalling Windows changes it.
 fn machine_guid() -> Option<String> {
@@ -158,7 +151,7 @@ impl Config {
     fn default_settings() -> Config {
         Config {
             device_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "My PC".into()),
-            password: random_password(),
+            password: String::new(),
             short_id: String::new(),
             short_id_key: String::new(),
             contacts: Vec::new(),
@@ -197,8 +190,4 @@ impl Config {
         let bytes: [u8; 32] = Sha256::digest(format!("remotedesk-machine-key-v1:{}", seed.trim().to_lowercase())).into();
         iroh::SecretKey::from_bytes(&bytes)
     }
-}
-
-fn yes() -> bool {
-    true
 }

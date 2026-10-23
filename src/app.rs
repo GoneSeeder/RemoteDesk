@@ -7,7 +7,7 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
-use crate::config::{Contact, Interactive, Profile, random_password, thumb_path};
+use crate::config::{Contact, Interactive, Profile, thumb_path};
 use crate::input::vk_for;
 use crate::net::{Login, Net, Presence, ViewStatus, Viewer, Wait};
 use crate::proto::{Input, WRONG_PASSWORD};
@@ -96,8 +96,8 @@ impl SettingsDraft {
             name: cfg.device_name.clone(),
             interactive: cfg.interactive,
             unattended: cfg.unattended,
-            password: cfg.password.clone(),
-            confirm: cfg.password.clone(),
+            password: if cfg.unattended { cfg.password.clone() } else { String::new() },
+            confirm: if cfg.unattended { cfg.password.clone() } else { String::new() },
             profile: cfg.unattended_profile,
             start_with_windows: cfg.start_with_windows,
             tokens: cfg.tokens.len(),
@@ -109,7 +109,6 @@ impl SettingsDraft {
 pub struct App {
     net: Net,
     address: String,
-    show_pw: bool,
     error: Option<String>,
     pending: Option<Pending>,
     session: Option<Session>,
@@ -150,7 +149,6 @@ impl App {
             updater,
             net,
             address: String::new(),
-            show_pw: false,
             error: None,
             pending: None,
             session: None,
@@ -196,7 +194,6 @@ impl App {
             updater,
             net,
             address: String::new(),
-            show_pw: false,
             error: None,
             pending: None,
             session: None,
@@ -478,10 +475,7 @@ impl App {
     }
 
     fn hero(&mut self, ui: &mut egui::Ui) {
-        let (short, password, unattended) = {
-            let sh = self.net.shared.lock().unwrap();
-            (sh.short_id.clone(), sh.cfg.password.clone(), sh.cfg.unattended)
-        };
+        let short = self.net.shared.lock().unwrap().short_id.clone();
         egui::Frame::NONE
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
@@ -528,56 +522,8 @@ impl App {
                                     ui.ctx().copy_text(shortid::format(s));
                                 }
                             }
-                            let hint = if unattended { "ส่ง ID (และรหัสผ่าน) ให้คนที่จะเข้ามาควบคุม" } else { "ส่ง ID ให้คนที่จะเข้ามาควบคุม" };
-                            ui.label(RichText::new(hint).color(MUTED).size(13.0));
+                            ui.label(RichText::new("ส่ง ID ให้คนที่จะเข้ามาควบคุม").color(MUTED).size(13.0));
                         });
-                    });
-                    let side = if narrow { Layout::top_down(Align::Min) } else { Layout::right_to_left(Align::Center) };
-                    if narrow {
-                        ui.add_space(12.0);
-                    }
-                    ui.with_layout(side, |ui| {
-                        egui::Frame::NONE
-                            .fill(SURFACE2)
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(16, 12))
-                            .show(ui, |ui| {
-                                ui.set_width(if narrow { ui.available_width() } else { 300.0 });
-                                ui.vertical(|ui| {
-                                    if !unattended {
-                                        ui.label(RichText::new("เข้าด้วยรหัสผ่าน").color(MUTED).size(13.0));
-                                        ui.label(RichText::new("ปิดอยู่ ต้องมีคนกดรับทุกครั้ง").color(TEXT).size(15.0));
-                                        if ui.small_button("ตั้งรหัสผ่าน").clicked() {
-                                            let sh = self.net.shared.lock().unwrap();
-                                            let mut d = SettingsDraft::from_cfg(&sh.cfg);
-                                            d.unattended = true;
-                                            self.settings = Some(d);
-                                        }
-                                        return;
-                                    }
-                                    ui.label(RichText::new("รหัสผ่าน").color(MUTED).size(13.0));
-                                    let shown = if self.show_pw { password.clone() } else { "•".repeat(password.chars().count()) };
-                                    ui.label(RichText::new(shown).font(FontId::monospace(22.0)).color(TEXT));
-                                    ui.horizontal(|ui| {
-                                        if ui.small_button(if self.show_pw { "ซ่อน" } else { "แสดง" }).clicked() {
-                                            self.show_pw = !self.show_pw;
-                                        }
-                                        if ui.small_button("คัดลอก").clicked() {
-                                            ui.ctx().copy_text(password.clone());
-                                        }
-                                        if ui.small_button("ตั้งเอง").clicked() {
-                                            let sh = self.net.shared.lock().unwrap();
-                                            self.settings = Some(SettingsDraft::from_cfg(&sh.cfg));
-                                        }
-                                        if ui.small_button("สุ่มใหม่").clicked() {
-                                            let mut sh = self.net.shared.lock().unwrap();
-                                            sh.cfg.password = random_password();
-                                            sh.cfg.tokens.clear();
-                                            sh.cfg.save();
-                                        }
-                                    });
-                                });
-                            });
                     });
                 };
                 if narrow {
@@ -859,10 +805,13 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut draft.name).margin(vec2(10.0, 7.0)).desired_width(f32::INFINITY));
             ui.add_space(8.0);
             ui.add_space(6.0);
-            ui.label(RichText::new("คำขอเชื่อมต่อ (ไม่ใช้รหัสผ่าน)").font(bold(14.5)));
-            ui.radio_value(&mut draft.interactive, Interactive::Always, "แสดงคำขอเชื่อมต่อเสมอ");
+            ui.label(RichText::new("หน้าต่างกดรับ เมื่อมีคนขอเชื่อมต่อ").font(bold(14.5)));
+            ui.radio_value(&mut draft.interactive, Interactive::Always, "แสดงเสมอ");
             ui.radio_value(&mut draft.interactive, Interactive::WhenOpen, "แสดงเฉพาะตอนเปิดหน้าต่าง RemoteDesk อยู่");
-            ui.radio_value(&mut draft.interactive, Interactive::Never, "ไม่แสดงเลย (เข้าได้ด้วยรหัสผ่านอย่างเดียว)");
+            ui.radio_value(&mut draft.interactive, Interactive::Never, "ไม่แสดง (ไม่รับคำขอเชื่อมต่อ)");
+            if draft.interactive == Interactive::Never && !draft.unattended {
+                ui.colored_label(AMBER, "จะไม่มีใครเข้าเครื่องนี้ได้ จนกว่าจะเปิดการเข้าด้วยรหัสผ่านด้านล่าง");
+            }
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
